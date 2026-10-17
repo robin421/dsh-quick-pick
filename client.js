@@ -49,6 +49,7 @@
 	var AUTOPICK = false;
 	var PREVIEW_PICKING = false;
 	var INJECTED_PAGE_SRCS = {};   // 已切过选区副本的预览页，避免反复重挂导致页面闪动
+	var LAST_PREVIEW_BAR_REPORT = 0;
 	var LAST_INPUT_COUNT = -1;
 	// 同一窗口多次热重载保持同一标识，便于从日志区分不同客户端
 	var CLIENT_TAG = (function () {
@@ -1067,7 +1068,12 @@
 		var previewBar = findFilePreviewToolbar();
 		if (previewBar && !previewBar.querySelector('.' + BTN_CLASS)) {
 			previewBar.appendChild(createToolbarButton());
-			report('file-preview-entry', { cls: String(previewBar.className || '').slice(0, 40) });
+			// 上报节流：预览工具栏会被 React 反复重建，不加节流会把日志刷爆
+			var nowTs = Date.now();
+			if (nowTs - LAST_PREVIEW_BAR_REPORT > 10000) {
+				LAST_PREVIEW_BAR_REPORT = nowTs;
+				report('file-preview-entry', { cls: String(previewBar.className || '').slice(0, 40) });
+			}
 		}
 
 		var inputs = findAddressInputs();
@@ -1190,7 +1196,7 @@
 			setTimeout(function () {
 				pending = false;
 				injectToolbarButtons();
-			}, 250);
+			}, 800);
 		});
 
 		return {
