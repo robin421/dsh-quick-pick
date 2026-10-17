@@ -1024,6 +1024,7 @@
 		var all = document.querySelectorAll(
 			'input[placeholder*="HTTP"], input[placeholder*="网址"], input[placeholder*="URL" i], input[placeholder*="url"], ' +
 			'input[placeholder*="address" i], input[class*="address" i], [class*="addressBox"] input, ' +
+			'[class*="iGvAsW_address"] input, [class*="iGvAsW_addressBox"] input, ' +
 			'[data-webview-ui] input, [data-webview-ui] textarea'
 		);
 		var out = [];
@@ -1033,6 +1034,17 @@
 			out.push(all[i]);
 		}
 		return out;
+	}
+
+	// 内置浏览器的工具栏本体（兜底锚点）：即使地址栏换了元素形态也能挂上
+	function findBrowserToolbar() {
+		var bars = document.querySelectorAll('[class*="iGvAsW_toolbar"]');
+		for (var i = 0; i < bars.length; i++) {
+			if (PANEL && PANEL.contains(bars[i])) continue;
+			if (!bars[i].offsetWidth && !bars[i].offsetHeight) continue;
+			return bars[i];
+		}
+		return null;
 	}
 
 	function createToolbarButton() {
@@ -1077,6 +1089,15 @@
 		}
 
 		var inputs = findAddressInputs();
+		var browserBar = findBrowserToolbar();
+		if (browserBar && inputs.length === 0 && !browserBar.querySelector('.' + BTN_CLASS)) {
+			browserBar.appendChild(createToolbarButton());
+			var bbTs = Date.now();
+			if (bbTs - LAST_PREVIEW_BAR_REPORT > 10000) {
+				LAST_PREVIEW_BAR_REPORT = bbTs;
+				report('browser-bar-entry', { cls: String(browserBar.className || '').slice(0, 40) });
+			}
+		}
 		if (inputs.length !== LAST_INPUT_COUNT) {
 			LAST_INPUT_COUNT = inputs.length;
 			var samples = [];
@@ -1111,6 +1132,8 @@
 		}
 		var fpb = findFilePreviewToolbar();
 		if (fpb && bars.indexOf(fpb) < 0) bars.push(fpb);
+		var bb = findBrowserToolbar();
+		if (bb && bars.indexOf(bb) < 0) bars.push(bb);
 
 		var btns = document.querySelectorAll('.' + BTN_CLASS);
 		for (var j = 0; j < btns.length; j++) {
