@@ -1,899 +1,1216 @@
-// dsh-quick-pick — 极简网页代码选区插件（client 端）
+// dsh-quick-pick — 网页选区插件（client 端）
 //
-// 功能：在 DeepSeek Harness 桌面端中，无论当前是：
-// 1) 右侧「浏览器」页签（Electron <webview>）
-// 2) 还是「HTML 文件预览」页签（如 demo/index.html，基于 iframe 沙箱）
-// 均可直接点选页面上的任意元素，精准提取其 CSS 选择器、HTML 代码、文本、关键样式、
-// 以及 React Fiber 源码定位（文件名 + 行号），一键写入对话输入框，供 AI 精准修改。
+// 设计（2026-10-17 修复版）：
+//
+//   DSH 现有「网页预览」帧是跨源沙箱文档（web-review 用 <sessionId>.localhost:<port>
+//   独立 origin，dsh-browser 也带 sandbox），外层插件脚本读不到它的 DOM —— 所以
+//   「往现有预览帧注入探针」的写法必然失效：点了按钮只有提示、页面上没有任何反应。
+//   这正是此前「点击没生效」的根因（旧版 .bak-panel-* 里已写明这个结论）。
+//
+//   本插件改为自带选区浮层，全程走宿主同源通道：
+//     1) 浮层内 iframe 通过 /quick-pick/read-html 取回目标页面 HTML，经 srcdoc 装载；
+//        srcdoc 文档与宿主同源，DOM 可直接读写，选区稳定可用；
+//     2) 点选元素 → 提取 Full XPath → 写入当前会话输入框（会话 API 优先，DOM 兜底）；
+//     3) <base> 指回原站目录，页面相对资源（css/js/图片）照常从原站加载；
+//     4) iframe 用 sandbox="allow-same-origin"：宿主能读 DOM，但页面脚本不执行，
+//        避免 demo 页脚本碰触宿主 GUI。
+//
+//   入口：网页预览地址栏旁的「✦ 选区 (XPath)」按钮（唯一注入点），
+//         快捷键 Cmd/Ctrl+Shift+E 也可直接开关浮层。
+//
+//   注：本文件刻意只往「网页预览地址栏」所在工具栏挂按钮。历史上的
+//   [class*="toolbar"] 全局扫描会把按钮挂到侧边栏/会话等各处，即「几个错误的入口」。
 
 (function () {
 	'use strict';
 
 	var SRC = 'dsh-quick-pick';
-	var HUD = null;
-	var ACTIVE = false;
 	var CTX = null;
 	var LAST_ERR = '';
-	var pollTimer = null;
 
-	// ── 注入到目标页面（webview / iframe）内部执行的高亮与提取探针 ────────────────
-	var INJECT_SCRIPT = String.raw`(function () {
-		if (window.__dshPickerActive) return;
-		window.__dshPickerActive = true;
+	var BTN_CLASS = '__dqp_toolbar_btn';
+	var PANEL_ID = '__dqp_panel';
+	var TOAST_ID = '__dqp_toast';
+	var URL_ID = '__dqp_url';
+	var FRAME_ID = '__dqp_frame';
+	var PICK_BTN_ID = '__dqp_pickbtn';
+	var CLOSE_BTN_ID = '__dqp_close';
+	var OPEN_BTN_ID = '__dqp_open';
+	var STATUS_ID = '__dqp_status';
+	var HILITE_ID = '__dqp_hilite';
+	var CURSOR_ID = '__dqp_cursor';
+	var URL_KEY = 'dsh-quick-pick:url';
 
-		var overlay = document.getElementById('__dsh_hl_box');
-		if (!overlay) {
-			overlay = document.createElement('div');
-			overlay.id = '__dsh_hl_box';
-			overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #3b82f6;' +
-				'background:rgba(59,130,246,0.18);border-radius:3px;box-sizing:border-box;display:none;transition:all 0.04s ease-out;';
-
-			var badge = document.createElement('div');
-			badge.id = '__dsh_hl_badge';
-			badge.style.cssText = 'position:absolute;left:0;top:-26px;background:#1e293b;color:#f8fafc;padding:2px 8px;' +
-				'font:11px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;border-radius:4px;white-space:nowrap;' +
-				'box-shadow:0 2px 8px rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.18);pointer-events:none;';
-			overlay.appendChild(badge);
-			(document.body || document.documentElement).appendChild(overlay);
+	var PANEL = null;
+	var FRAME = null;
+	var FRAME_DOC = null;
+	var PICKING = false;
+	var HOVERED = null;
+	var AUTOPICK = false;
+	var PREVIEW_PICKING = false;
+	var INJECTED_PAGE_SRCS = {};   // 已切过选区副本的预览页，避免反复重挂导致页面闪动
+	var LAST_INPUT_COUNT = -1;
+	// 同一窗口多次热重载保持同一标识，便于从日志区分不同客户端
+	var CLIENT_TAG = (function () {
+		try {
+			var t = sessionStorage.getItem('dsh-quick-pick:tag');
+			if (!t) {
+				t = Math.random().toString(36).slice(2, 8);
+				sessionStorage.setItem('dsh-quick-pick:tag', t);
+			}
+			return t;
+		} catch (e) {
+			return Math.random().toString(36).slice(2, 8);
 		}
+	})();
 
-		var hoveredEl = null;
-
-		function updateHighlighter(el) {
-			if (!el || el === overlay || overlay.contains(el)) return;
-			hoveredEl = el;
-			var rect = el.getBoundingClientRect();
-			if (rect.width === 0 && rect.height === 0) {
-				overlay.style.display = 'none';
-				return;
-			}
-			overlay.style.display = 'block';
-			overlay.style.left = rect.left + 'px';
-			overlay.style.top = rect.top + 'px';
-			overlay.style.width = rect.width + 'px';
-			overlay.style.height = rect.height + 'px';
-			overlay.style.borderColor = '#3b82f6';
-			overlay.style.backgroundColor = 'rgba(59,130,246,0.18)';
-
-			var badge = document.getElementById('__dsh_hl_badge');
-			if (badge) {
-				var tag = el.tagName ? el.tagName.toLowerCase() : '';
-				var id = el.id ? '#' + el.id : '';
-				var cls = (el.classList && el.classList.length) ? ('.' + Array.prototype.slice.call(el.classList).slice(0, 2).join('.')) : '';
-				var w = Math.round(rect.width);
-				var h = Math.round(rect.height);
-				badge.textContent = '<' + tag + '>' + id + cls + ' (' + w + '×' + h + ')';
-				if (rect.top < 30) {
-					badge.style.top = '2px';
-				} else {
-					badge.style.top = '-26px';
-				}
-			}
-		}
-
-		function getCssSelector(el) {
-			if (!el || el.nodeType !== 1) return '';
-			if (el === document.body) return 'body';
-			if (el === document.documentElement) return 'html';
-
-			if (el.id) {
-				try {
-					if (document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) return '#' + el.id;
-				} catch (e) {}
-			}
-
-			var testId = el.getAttribute('data-testid');
-			if (testId) {
-				try {
-					if (document.querySelectorAll('[data-testid="' + CSS.escape(testId) + '"]').length === 1) {
-						return '[data-testid="' + testId + '"]';
-					}
-				} catch (e2) {}
-			}
-
-			var path = [];
-			var cur = el;
-			while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
-				var selector = cur.tagName.toLowerCase();
-				if (cur.id) {
-					try {
-						if (document.querySelectorAll('#' + CSS.escape(cur.id)).length === 1) {
-							path.unshift('#' + cur.id);
-							break;
-						}
-					} catch (e3) {}
-				}
-
-				var sib = cur, nth = 1;
-				while ((sib = sib.previousElementSibling)) {
-					if (sib.tagName === cur.tagName) nth++;
-				}
-				if (nth > 1 || cur.nextElementSibling) {
-					selector += ':nth-of-type(' + nth + ')';
-				}
-				path.unshift(selector);
-				cur = cur.parentElement;
-			}
-			return path.join(' > ');
-		}
-
-		function getCleanHtml(el) {
-			if (!el) return '';
-			var html = el.outerHTML || '';
-			if (html.length > 3500) {
-				var clone = el.cloneNode(false);
-				var openTag = clone.outerHTML.replace(new RegExp('<\\/[^>]+>$'), '');
-				var closeTag = '<' + '/' + el.tagName.toLowerCase() + '>';
-				var preview = (el.innerText || el.textContent || '').trim().slice(0, 300);
-				html = openTag + '\n  <!-- 子节点内容较多已截断，部分文本: ' + preview.replace(/\n+/g, ' ') + ' -->\n' + closeTag;
-			}
-			return html;
-		}
-
-		function getKeyStyles(el) {
-			var cs = window.getComputedStyle(el);
-			var keys = [
-				'display', 'position', 'width', 'height', 'color', 'background-color',
-				'font-size', 'font-weight', 'font-family', 'line-height',
-				'margin', 'padding', 'border', 'border-radius',
-				'flex-direction', 'justify-content', 'align-items', 'gap',
-				'grid-template-columns', 'opacity', 'z-index'
-			];
-			var res = {};
-			for (var i = 0; i < keys.length; i++) {
-				var k = keys[i];
-				var v = cs.getPropertyValue(k);
-				if (v && v !== 'normal' && v !== 'none' && v !== 'auto' && v !== 'rgba(0, 0, 0, 0)' && v !== '0px' && v !== 'visible') {
-					res[k] = v;
-				}
-			}
-			return res;
-		}
-
-		function getReactDebugInfo(el) {
-			var cur = el;
-			while (cur) {
-				var keys = Object.keys(cur);
-				var fiberKey = null;
-				for (var i = 0; i < keys.length; i++) {
-					if (keys[i].startsWith('__reactFiber$') || keys[i].startsWith('__reactInternalInstance$')) {
-						fiberKey = keys[i];
-						break;
-					}
-				}
-				if (fiberKey && cur[fiberKey]) {
-					var f = cur[fiberKey];
-					var compName = '';
-					var source = null;
-					while (f) {
-						if (!source && f._debugSource) {
-							source = f._debugSource;
-						}
-						if (!compName && typeof f.type === 'function' && f.type.name) {
-							compName = f.type.name;
-						} else if (!compName && typeof f.type === 'string' && f.type !== cur.tagName.toLowerCase()) {
-							compName = f.type;
-						}
-						if (source && compName) break;
-						f = f.return;
-					}
-					if (source || compName) {
-						return {
-							component: compName || '',
-							fileName: source ? source.fileName : '',
-							lineNumber: source ? source.lineNumber : '',
-							columnNumber: source ? source.columnNumber : ''
-						};
-					}
-				}
-				cur = cur.parentElement;
-			}
-			var ds = el.closest ? el.closest('[data-source-file], [data-component]') : null;
-			if (ds) {
-				return {
-					component: ds.getAttribute('data-component') || '',
-					fileName: ds.getAttribute('data-source-file') || '',
-					lineNumber: ds.getAttribute('data-source-line') || '',
-					columnNumber: ds.getAttribute('data-source-column') || ''
-				};
-			}
-			return null;
-		}
-
-		function extractInfo(el) {
-			var rect = el.getBoundingClientRect();
-			var reactInfo = getReactDebugInfo(el);
-			return {
-				tag: el.tagName ? el.tagName.toLowerCase() : '',
-				id: el.id || '',
-				classes: Array.prototype.slice.call(el.classList || []),
-				selector: getCssSelector(el),
-				html: getCleanHtml(el),
-				text: (el.innerText || el.textContent || '').trim().slice(0, 600),
-				style: getKeyStyles(el),
-				rect: {
-					x: Math.round(rect.x),
-					y: Math.round(rect.y),
-					width: Math.round(rect.width),
-					height: Math.round(rect.height)
-				},
-				url: window.__DSH_REAL_URL__ || window.location.href,
-				react: reactInfo
-			};
-		}
-
-		function postToParent(msg) {
-			try {
-				if (window.parent && window.parent !== window) {
-					window.parent.postMessage(msg, '*');
-				}
-			} catch (e) {}
-		}
-
-		var cursorStyle = null;
-
-		function startPick() {
-			window.__dshPickerActive = true;
-			if (!cursorStyle) {
-				cursorStyle = document.createElement('style');
-				cursorStyle.id = '__dsh_picker_cursor';
-				cursorStyle.textContent = '*, * * { cursor: crosshair !important; }';
-				(document.head || document.documentElement).appendChild(cursorStyle);
-			}
-			document.addEventListener('mouseover', onMouseMove, true);
-			document.addEventListener('mousemove', onMouseMove, true);
-			document.addEventListener('click', onClick, true);
-			document.addEventListener('keydown', onKeyDown, true);
-			window.addEventListener('scroll', onScroll, true);
-			window.addEventListener('resize', onScroll, true);
-		}
-
-		function cleanup() {
-			window.__dshPickerActive = false;
-			if (cursorStyle) {
-				try { cursorStyle.remove(); } catch (e) {}
-				cursorStyle = null;
-			}
-			document.removeEventListener('mouseover', onMouseMove, true);
-			document.removeEventListener('mousemove', onMouseMove, true);
-			document.removeEventListener('click', onClick, true);
-			document.removeEventListener('keydown', onKeyDown, true);
-			window.removeEventListener('scroll', onScroll, true);
-			window.removeEventListener('resize', onScroll, true);
-			if (overlay) overlay.style.display = 'none';
-		}
-
-		window.__dshCancelPick = function () {
-			window.__DSH_PICK_RESULT__ = '__CANCEL__';
-			postToParent({ source: 'dsh-quick-pick', type: 'cancel' });
-			cleanup();
+	function envInfo(extra) {
+		var base = {
+			tag: CLIENT_TAG,
+			vp: window.innerWidth + 'x' + window.innerHeight,
+			toolbarBtn: document.querySelectorAll('.' + BTN_CLASS).length
 		};
-
-		function onMouseMove(e) {
-			if (!window.__dshPickerActive) return;
-			updateHighlighter(e.target);
+		if (!extra) return base;
+		for (var k in extra) {
+			if (Object.prototype.hasOwnProperty.call(extra, k)) base[k] = extra[k];
 		}
+		return base;
+	}
 
-		function onScroll() {
-			if (hoveredEl && window.__dshPickerActive) updateHighlighter(hoveredEl);
+	function $(id) {
+		return document.getElementById(id);
+	}
+
+	// ── 诊断上报：落到 ~/.dsh/logs/quick-pick.log，便于事后排查 ──────────
+	// 桌面端某些协议/沙箱下 sendBeacon 与 fetch 都可能被挡（实测用户窗口的
+	// 上报一度全丢），所以主通道改成 <img> GET —— 请求几乎不会被拦，
+	// 数据编码进 query，host 端同样落盘。
+	function report(event, data) {
+		var payload;
+		try {
+			payload = JSON.stringify(data || null);
+		} catch (e) {
+			payload = 'null';
 		}
+		console.info('[' + SRC + '] ' + event, data || '');
 
-		function onClick(e) {
-			if (!window.__dshPickerActive) return;
-			e.preventDefault();
-			e.stopPropagation();
-			e.stopImmediatePropagation();
+		// 上报地址候选：相对路径（web 端）+ 本机常见端口（桌面端协议下相对请求不通）
+		var payloadQs = 'event=' + encodeURIComponent(event) + '&payload=' + encodeURIComponent(payload.slice(0, 1800));
+		var bases = [''];
+		try {
+			if (location.origin && location.origin.indexOf('http') === 0) bases.push(location.origin);
+			bases.push('http://127.0.0.1:19387');
+		} catch (e) {}
 
-			var target = e.target;
-			if (!target) {
-				cleanup();
-				return;
-			}
-
-			if (overlay) {
-				overlay.style.borderColor = '#22c55e';
-				overlay.style.backgroundColor = 'rgba(34, 197, 94, 0.35)';
-			}
-
-			var info = extractInfo(target);
-			window.__DSH_PICK_RESULT__ = info;
-
-			// 1. 发送给 parent 窗口 (iframe 场景)
-			postToParent({ source: 'dsh-quick-pick', type: 'picked', payload: info });
-
-			// 2. 发送 console 消息 (webview 场景)
+		for (var i = 0; i < bases.length; i++) {
 			try {
-				console.log('__DSH_PICK__:' + JSON.stringify(info));
-			} catch (err) {}
-
-			setTimeout(cleanup, 220);
+				var probe = new Image();
+				probe.src = bases[i] + '/quick-pick/log?' + payloadQs + '&_=' + Date.now();
+			} catch (e2) {}
 		}
 
-		function onKeyDown(e) {
-			if (e.key === 'Escape' && window.__dshPickerActive) {
-				e.preventDefault();
-				e.stopPropagation();
-				window.__dshCancelPick();
-			}
-		}
+		// 兜底：正常环境下的 POST 通道
+		try {
+			fetch('/quick-pick/log', {
+				method: 'POST',
+				keepalive: true,
+				credentials: 'omit',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ event: event, data: data || null })
+			}).catch(function () {});
+		} catch (e2) {}
+	}
 
-		// 监听父窗口开关信号
-		window.addEventListener('message', function (ev) {
-			var d = ev.data || {};
-			if (d.source !== 'dsh-quick-pick') return;
-			if (d.type === 'activate') {
-				startPick();
-			} else if (d.type === 'cancel') {
-				cleanup();
-			}
-		});
+	// ── CSS 选择器 / DOM 路径 → Full XPath ─────────────────────────────
+	// web-review 的 bridge 给出的是 CSS 形式路径，例如
+	//   "html > body > div#app > div:nth-of-type(2) > button"
+	// 这里把它翻成对 AI 更通用的 Full XPath。
+	function convertSelectorToXPath(sel, defaultTag) {
+		var raw = String(sel || '').trim();
+		if (!raw) return defaultTag ? '//' + String(defaultTag).toLowerCase() : '';
 
-		startPick();
-	})();`;
+		var parts = raw.split('>').map(function (s) { return s.trim(); }).filter(Boolean);
+		if (!parts.length) return defaultTag ? '//' + String(defaultTag).toLowerCase() : '';
 
-	// ── 格式化给 AI 的提示词草稿 ────────────────────────────────────
-	function buildDraft(info) {
-		var lines = [];
-		lines.push('【选中的页面代码与元素定位】');
-		if (info.url) {
-			if (info.url.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(info.url)) {
-				lines.push('页面文件: ' + info.url);
+		var segs = [];
+		for (var i = 0; i < parts.length; i++) {
+			var seg = parts[i];
+			var tag = /^([a-zA-Z][a-zA-Z0-9_-]*)/.exec(seg);
+			var tagName = tag ? tag[1].toLowerCase() : '*';
+			var idMatch = /#([A-Za-z_][\w-]*)/.exec(seg);
+			var nth = /:nth-of-type\((\d+)\)/.exec(seg);
+
+			if (tagName === 'html' || tagName === 'body') {
+				segs.push(tagName);
+			} else if (idMatch) {
+				segs.push((tag ? tagName : '*') + '[@id="' + idMatch[1] + '"]');
+			} else if (nth) {
+				segs.push(tagName + '[' + nth[1] + ']');
 			} else {
-				lines.push('页面地址: ' + info.url);
+				// web-review 只在同标签兄弟竞争时才写 nth-of-type，没有它即为该标签的第 1 个
+				segs.push(tagName + '[1]');
 			}
-		}
-		if (info.react) {
-			if (info.react.component) lines.push('组件名称: <' + info.react.component + ' />');
-			if (info.react.fileName) {
-				lines.push('源码文件: ' + info.react.fileName + (info.react.lineNumber ? (':' + info.react.lineNumber) : ''));
-			}
-		}
-		if (info.selector) lines.push('CSS 选择器: ' + info.selector);
-		lines.push('元素标签: <' + info.tag + '>' +
-			(info.id ? '  id="' + info.id + '"' : '') +
-			(info.classes && info.classes.length ? '  class="' + info.classes.join(' ') + '"' : ''));
-		if (info.text) {
-			lines.push('当前文本: ' + String(info.text).replace(/\s+/g, ' ').slice(0, 300));
-		}
-		if (info.rect) {
-			lines.push('尺寸位置: ' + info.rect.width + '×' + info.rect.height + ' @ (' + info.rect.x + ',' + info.rect.y + ')');
 		}
 
-		var sks = Object.keys(info.style || {});
-		if (sks.length > 0) {
-			lines.push('关键样式:');
-			sks.forEach(function (k) {
-				lines.push('  ' + k + ': ' + info.style[k]);
+		var joined = segs.join('/');
+		return (segs[0] === 'html' || segs[0] === 'body') ? '/' + joined : '//' + joined;
+	}
+
+	// ── 驱动「当前网页预览」的选区（不新开任何窗口） ─────────────────────
+	// 预览帧是独立 origin 的沙箱文档，插件无法往里注入探针；但 web-review 已经
+	// 在帧里放了 bridge，它的选区开关能驱动选区，选中事件会 postMessage 回宿主。
+	// 所以 quick-pick 的做法是：点它的按钮 → 截获选中事件 → 写 Full XPath。
+	//
+	// 全页查找该开关（实测它不一定位于 [data-webview-ui] 容器内），并排除两类干扰：
+	//   1) 侧边栏那个「选区批注：打开网页预览」—— 是导航按钮，点了会开新页签
+	//      （这正是此前"点选区却打开新页面"的根因）；
+	//   2) quick-pick 自己的入口按钮。
+	function findPreviewPickButton() {
+		var btns = document.querySelectorAll('button, [role="button"]');
+		for (var i = 0; i < btns.length; i++) {
+			var b = btns[i];
+			if (!b.offsetWidth && !b.offsetHeight) continue;
+			if (b.id && b.id.indexOf('__dqp') === 0) continue;
+			if (b.classList && b.classList.contains(BTN_CLASS)) continue;
+			var label = (b.getAttribute('aria-label') || '') + ' ' + (b.title || '') + ' ' + (b.textContent || '');
+			if (/XPath 选区/.test(label)) continue;
+			if (/打开/.test(label)) continue;
+			// web-review 的选区开关：aria-label「添加页面注释」/「Add page comments」；
+			// 中文 title 另写作「选区批注…」。
+			if (/添加页面注释|add page comments|选区批注|点击添加评论|页面批注/i.test(label)) return b;
+		}
+		return null;
+	}
+
+	// 找不到通道时的现场取证：把候选按钮、iframe 详情一起上报，便于一次改准
+	function probePickCandidates() {
+		var out = { webviewUi: document.querySelectorAll('[data-webview-ui]').length, frames: [], buttons: [] };
+
+		var fl = document.querySelectorAll('iframe, webview, embed, object');
+		for (var i = 0; i < fl.length && out.frames.length < 8; i++) {
+			var f = fl[i];
+			var readable = false;
+			try { readable = !!f.contentDocument; } catch (e) { readable = false; }
+			out.frames.push({
+				tag: f.tagName.toLowerCase(),
+				src: String(f.getAttribute('src') || '').slice(0, 80),
+				sb: f.getAttribute('sandbox'),
+				size: f.offsetWidth + 'x' + f.offsetHeight,
+				vis: !!(f.offsetWidth || f.offsetHeight),
+				readable: readable
 			});
 		}
 
-		lines.push('');
-		lines.push('当前 HTML:');
-		lines.push('```html');
-		lines.push(info.html);
-		lines.push('```');
-		lines.push('');
-		lines.push('请根据以上选取的代码和定位信息，精准修改对应源码：');
-		return lines.join('\n');
+		var btns = document.querySelectorAll('button, [role="button"]');
+		for (var j = 0; j < btns.length && out.buttons.length < 24; j++) {
+			var b = btns[j];
+			if (!b.offsetWidth && !b.offsetHeight) continue;
+			var al = b.getAttribute('aria-label') || '';
+			var ti = b.title || '';
+			var tx = (b.textContent || '').replace(/\s+/g, ' ').trim();
+			// 只留"像功能入口"的按钮，避免被侧边栏会话列表淹没
+			if (!al && !ti && !/预览|浏览器|选区|注释|批注|打开|检查|元素|刷新/.test(tx)) continue;
+			if (/会话|工作区|账号|子智能体/.test(al + tx)) continue;
+			out.buttons.push({
+				al: al.slice(0, 24),
+				ti: ti.slice(0, 30),
+				tx: tx.slice(0, 20),
+				cls: String(b.className || '').slice(0, 24)
+			});
+		}
+		return out;
 	}
 
-	// ── 写入会话输入框 ──────────────────────────────────────────
-	function writeDraft(ctx, text) {
-		var errs = [];
+	// 诊断出口（网络通道不可用时用）：把现场信息写进对话输入框，用户直接可复制
+	function reportToDraft(title, obj) {
 		try {
-			var sessions = null;
-			try { sessions = ctx.get ? ctx.get('sessions') : null; } catch (e) {}
-			if (!sessions) { try { sessions = ctx.sessions; } catch (e) {} }
+			var text = '【dsh-quick-pick 诊断】' + title + ' ' + JSON.stringify(obj).slice(0, 2400);
+			var ok = writeDraft(CTX, text);
+			if (!ok) console.warn('[' + SRC + '] 诊断写入失败:', LAST_ERR);
+		} catch (e) {}
+	}
 
-			if (sessions && sessions.list) {
-				var snap = null;
-				try { snap = sessions.list.getSnapshot ? sessions.list.getSnapshot() : null; } catch (e) {}
-				var cur = null;
-				if (snap) {
-					if (snap.current) {
-						cur = snap.current;
-					} else if (snap.byId) {
-						var ids = snap.ids || Object.keys(snap.byId);
-						for (var i = 0; i < ids.length; i++) {
-							var row = snap.byId[ids[i]];
-							if (row && row.retainedBy && (row.retainedBy.mainView || 0) > 0) {
-								cur = ids[i];
-								break;
-							}
-						}
-						if (cur === null && ids.length) cur = ids[ids.length - 1];
-					}
-				}
-				if (cur) {
-					var scope = sessions.scope(cur);
-					if (scope) {
-						var conv = null;
-						try { conv = scope.get ? scope.get('conversation') : null; } catch (e) {}
-						if (!conv && ctx.get) { try { conv = ctx.get('conversation'); } catch (e) {} }
-
-						if (conv && conv.input && typeof conv.input.for === 'function') {
-							var input = conv.input.for(scope);
-							var oldDraft = '';
-							try {
-								var snapState = input.state && input.state.getSnapshot ? input.state.getSnapshot() : null;
-								oldDraft = (snapState && snapState.draft) || '';
-							} catch (e) {}
-							var newDraft = oldDraft.trim() ? (oldDraft + '\n\n' + text) : text;
-							input.setDraft(newDraft);
-							LAST_ERR = '';
-							return true;
-						}
-					}
-				}
-			}
-		} catch (e) {
-			errs.push('官方 API: ' + e);
+	function startPreviewPick() {
+		// 已经在选区中：再点一次入口就是「退出选区模式」
+		if (PREVIEW_PICKING || PICKING) {
+			exitPickMode();
+			return true;
 		}
 
-		// DOM 兜底（兼容 React 受控组件）
+		// 1) 有 web-review 的选区开关就用它（它自带页面桥，能给出元素快照）
+		var btn = findPreviewPickButton();
+		if (btn) {
+			if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+				showToast('预览还没就绪：等页面加载完，或先在地址栏打开一个能访问的网址', true);
+				report('preview-pick', { ok: false, reason: 'disabled' });
+				return false;
+			}
+			try { btn.click(); } catch (e) {}
+			setEntryPicking(true);
+			showToast('选区已开启：在当前网页上点元素，Full XPath 会写进输入框', false);
+			report('preview-pick', { ok: true, how: 'web-review' });
+			return true;
+		}
+
+		// 2) 没有它：直接在当前网页预览帧里选区（同源可读时）
+		if (pickInPageFrame()) {
+			showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath（Esc 取消）', false);
+			report('preview-pick', { ok: true, how: 'page-frame' });
+			return true;
+		}
+
+		// 3) 都不可用：把现场信息写进输入框（网络日志通道不通时的唯一定位手段）
+		var probe = probePickCandidates();
+		showToast('当前网页读不到 DOM（跨源沙箱），现场信息已写入输入框', true);
+		report('preview-pick', { ok: false, reason: 'no-channel', probe: probe });
+		reportToDraft('无法在当前网页选区', probe);
+		return false;
+	}
+
+	// 入口按钮的「选区中」状态（选中/取消后自动复位）
+	function setEntryPicking(on) {
+		PREVIEW_PICKING = !!on;
+		renderToolbarButtons();
+	}
+
+	// ── Full XPath 计算 ────────────────────────────────────────────────
+	function fullXPath(el) {
+		if (!el || el.nodeType !== 1) return '';
+		var tag = el.tagName.toLowerCase();
+		if (tag === 'html') return '/html';
+		if (tag === 'body') return '/html/body';
+
+		var segs = [];
+		var cur = el;
+		while (cur && cur.nodeType === 1) {
+			var t = cur.tagName.toLowerCase();
+			if (t === 'html') break;
+			if (t === 'body') { segs.unshift('body'); break; }
+
+			var idx = 1;
+			var parent = cur.parentElement;
+			if (parent) {
+				var kids = parent.children;
+				for (var i = 0; i < kids.length; i++) {
+					var k = kids[i];
+					if (k === cur) break;
+					if (k.tagName && k.tagName.toLowerCase() === t) idx++;
+				}
+			}
+			segs.unshift(t + '[' + idx + ']');
+			cur = parent;
+		}
+		return '/html/' + segs.join('/');
+	}
+
+	// ── 写入会话输入框 ─────────────────────────────────────────────────
+	function writeDraft(ctx, text) {
+		var errs = [];
+
 		try {
-			var ta = document.querySelector('textarea, [contenteditable="true"]');
+			var sessions = null;
+			try { sessions = ctx && ctx.get ? ctx.get('sessions') : null; } catch (e) {}
+			if (!sessions) { try { sessions = ctx ? ctx.sessions : null; } catch (e) {} }
+
+			if (sessions && sessions.list) {
+				var cur = null;
+				try {
+					var snap = sessions.list.getSnapshot ? sessions.list.getSnapshot() : null;
+					if (snap) {
+						if (snap.current) {
+							cur = snap.current;
+						} else if (snap.byId) {
+							var ids = snap.ids || Object.keys(snap.byId);
+							for (var i = 0; i < ids.length; i++) {
+								var row = snap.byId[ids[i]];
+								if (row && row.retainedBy && (row.retainedBy.mainView || 0) > 0) {
+									cur = ids[i];
+									break;
+								}
+							}
+							if (cur === null && ids.length) cur = ids[ids.length - 1];
+						}
+					}
+				} catch (e) {}
+
+				if (cur) {
+					var scope = sessions.scope(cur);
+					var conv = null;
+					try { conv = scope && scope.get ? scope.get('conversation') : null; } catch (e) {}
+					if (!conv && ctx && ctx.get) { try { conv = ctx.get('conversation'); } catch (e) {} }
+
+					if (conv && conv.input && typeof conv.input.for === 'function') {
+						var input = conv.input.for(scope);
+						var oldDraft = '';
+						try {
+							var st = input.state && input.state.getSnapshot ? input.state.getSnapshot() : null;
+							oldDraft = (st && st.draft) || '';
+						} catch (e) {}
+						var next = oldDraft.trim() ? (oldDraft.trimEnd() + ' ' + text) : text;
+						input.setDraft(next);
+						LAST_ERR = '';
+						return true;
+					}
+					errs.push('会话输入接口不可用');
+				} else {
+					errs.push('未找到当前会话');
+				}
+			} else {
+				errs.push('sessions 服务不可用');
+			}
+		} catch (e) {
+			errs.push('API: ' + e);
+		}
+
+		// DOM 兜底：只在会话输入框候选里找，避免命中页面上无关的可编辑区
+		try {
+			var cands = document.querySelectorAll('textarea, [contenteditable="true"]');
+			var ta = null;
+			for (var j = 0; j < cands.length; j++) {
+				var node = cands[j];
+				if (node.closest && node.closest('#' + PANEL_ID)) continue;
+				ta = node;
+				break;
+			}
 			if (ta) {
 				ta.focus();
 				if (ta.tagName === 'TEXTAREA') {
 					var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-					var currentVal = ta.value || '';
-					var combined = currentVal.trim() ? (currentVal + '\n\n' + text) : text;
+					var curVal = ta.value || '';
+					var combined = curVal.trim() ? (curVal.trimEnd() + ' ' + text) : text;
 					setter.call(ta, combined);
 					ta.dispatchEvent(new Event('input', { bubbles: true }));
 					ta.dispatchEvent(new Event('change', { bubbles: true }));
-					LAST_ERR = '';
-					return true;
 				} else {
-					var currentText = ta.textContent || '';
-					var combinedText = currentText.trim() ? (currentText + '\n\n' + text) : text;
-					ta.textContent = combinedText;
+					var curText = ta.textContent || '';
+					ta.textContent = curText.trim() ? (curText.trimEnd() + ' ' + text) : text;
 					ta.dispatchEvent(new InputEvent('input', { bubbles: true }));
-					LAST_ERR = '';
-					return true;
 				}
-			} else {
-				errs.push('未找到输入框');
+				LAST_ERR = '';
+				return true;
 			}
+			errs.push('未找到输入框');
 		} catch (e2) {
-			errs.push('DOM 兜底: ' + e2);
+			errs.push('DOM: ' + e2);
 		}
 
 		LAST_ERR = errs.join(' | ');
-		console.warn('[' + SRC + '] 写入输入框失败:', LAST_ERR);
+		console.warn('[' + SRC + '] 写入失败:', LAST_ERR);
 		return false;
 	}
 
-	function toAppUrl(rawUrl) {
-		if (!rawUrl) return '';
-		try {
-			var u = new URL(rawUrl, window.location.href);
-			if (u.protocol === 'http:' && (u.hostname === '127.0.0.1' || u.hostname === 'localhost')) {
-				return window.location.origin + u.pathname + u.search;
-			}
-			return u.href;
-		} catch (e) {
-			return rawUrl;
+	// ── Toast ──────────────────────────────────────────────────────────
+	function showToast(msg, isErr) {
+		var toast = $(TOAST_ID);
+		if (!toast) {
+			toast = document.createElement('div');
+			toast.id = TOAST_ID;
+			toast.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%) translateY(-10px);z-index:2147483647;' +
+				'padding:8px 18px;border-radius:8px;font:500 13px/1.4 -apple-system,system-ui,sans-serif;' +
+				'box-shadow:0 8px 24px rgba(0,0,0,0.45);pointer-events:none;transition:all 0.22s cubic-bezier(0.16,1,0.3,1);opacity:0;max-width:80vw;word-break:break-all;text-align:center;';
+			document.body.appendChild(toast);
+		}
+		toast.style.background = isErr ? '#7f1d1d' : '#0f172a';
+		toast.style.color = isErr ? '#fecaca' : '#f8fafc';
+		toast.style.border = isErr ? '1px solid #ef4444' : '1px solid #3b82f6';
+		toast.textContent = msg;
+		toast.style.opacity = '1';
+		toast.style.transform = 'translateX(-50%) translateY(0)';
+		clearTimeout(toast.__timer);
+		toast.__timer = setTimeout(function () {
+			toast.style.opacity = '0';
+			toast.style.transform = 'translateX(-50%) translateY(-10px)';
+		}, 3200);
+	}
+
+	function setStatus(msg, isErr) {
+		var el = $(STATUS_ID);
+		if (!el) return;
+		el.textContent = msg || '';
+		el.style.color = isErr ? '#fca5a5' : '#94a3b8';
+	}
+
+	// ── 高亮框（活在 iframe 文档里） ────────────────────────────────────
+	function clearHilite() {
+		HOVERED = null;
+		if (!FRAME_DOC) return;
+		var box = FRAME_DOC.getElementById(HILITE_ID);
+		if (box) box.style.display = 'none';
+	}
+
+	function showHilite(el) {
+		if (!FRAME_DOC || !el || el.nodeType !== 1) return;
+		if (el.id === HILITE_ID) return;
+		HOVERED = el;
+
+		var box = FRAME_DOC.getElementById(HILITE_ID);
+		if (!box) {
+			box = FRAME_DOC.createElement('div');
+			box.id = HILITE_ID;
+			box.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #3b82f6;' +
+				'background:rgba(59,130,246,0.18);border-radius:3px;box-sizing:border-box;display:none;transition:all 0.04s ease-out;';
+			(FRAME_DOC.body || FRAME_DOC.documentElement).appendChild(box);
+		}
+		var r = el.getBoundingClientRect();
+		if (!r.width && !r.height) { box.style.display = 'none'; return; }
+		box.style.display = 'block';
+		box.style.left = r.left + 'px';
+		box.style.top = r.top + 'px';
+		box.style.width = r.width + 'px';
+		box.style.height = r.height + 'px';
+	}
+
+	// ── iframe 内事件（宿主脚本直接监听同源文档） ────────────────────────
+	function onFrameOver(e) {
+		if (!PICKING) return;
+		showHilite(e.target);
+	}
+
+	function onFrameOut(e) {
+		if (!PICKING) return;
+		if (e.target === HOVERED) clearHilite();
+	}
+
+	function onFrameClick(e) {
+		if (!PICKING) return;
+		e.preventDefault();
+		e.stopPropagation();
+		var el = (e.target && e.target.nodeType === 1) ? e.target : HOVERED;
+		if (!el) return;
+		var box = FRAME_DOC && FRAME_DOC.getElementById(HILITE_ID);
+		if (box) { box.style.borderColor = '#22c55e'; box.style.background = 'rgba(34,197,94,0.35)'; }
+		onPicked(el);
+	}
+
+	function onFrameKey(e) {
+		if (e.key === 'Escape' && PICKING) {
+			e.preventDefault();
+			stopPick();
 		}
 	}
 
-	function decodeSidebarPath(src) {
-		if (!src) return '';
+	function detachFrame() {
+		if (!FRAME_DOC) return;
 		try {
-			var u = new URL(src, window.location.href);
-			var m = /^\/sidebar\/html\/[^/]+\/(.*)$/.exec(u.pathname);
-			if (m) {
-				var segs = m[1].split('/').filter(Boolean).map(decodeURIComponent);
-				return '/' + segs.join('/');
-			}
+			FRAME_DOC.removeEventListener('mouseover', onFrameOver, true);
+			FRAME_DOC.removeEventListener('pointermove', onFrameOver, true);
+			FRAME_DOC.removeEventListener('mouseout', onFrameOut, true);
+			FRAME_DOC.removeEventListener('click', onFrameClick, true);
+			FRAME_DOC.removeEventListener('keydown', onFrameKey, true);
 		} catch (e) {}
-		return src;
+		FRAME_DOC = null;
 	}
 
-	// ── 查找当前活动的所有 webview 与 iframe ────────────────────────
-	function getTargetFrames() {
-		var list = [];
-		// 1. Electron webview
-		var webviews = document.querySelectorAll('webview');
-		for (var i = 0; i < webviews.length; i++) {
-			var wv = webviews[i];
-			var wr = wv.getBoundingClientRect();
-			if (wr.width > 20 && wr.height > 20) {
-				list.push({ type: 'webview', element: wv });
-			}
-		}
-		// 2. HTML 预览 iframe
-		var iframes = document.querySelectorAll('iframe');
-		for (var j = 0; j < iframes.length; j++) {
-			var f = iframes[j];
-			var fr = f.getBoundingClientRect();
-			if (fr.width > 20 && fr.height > 20 && !f.closest('#__dqp_panel')) {
-				list.push({ type: 'iframe', element: f });
-			}
-		}
-		return list;
+	function onFrameLoad() {
+		attachFrame();
 	}
 
-	function setStatus(html, isErr) {
-		if (!HUD) return;
-		var label = HUD.querySelector('span.dqp-label');
-		if (label) {
-			label.innerHTML = html;
-			label.style.color = isErr ? '#ff8b8b' : '';
-		}
+	function attachFrame() {
+		if (!FRAME) return;
+		var doc = null;
+		try { doc = FRAME.contentDocument; } catch (e) { doc = null; }
+		attachToDoc(doc, 'panel-frame');
 	}
 
-	function syncUI() {
-		if (HUD) {
-			HUD.classList.toggle('on', ACTIVE);
-			var dot = HUD.querySelector('.dot');
-			if (dot) dot.style.background = ACTIVE ? '#4ade80' : '#555';
-			if (dot) dot.style.boxShadow = ACTIVE ? '0 0 8px #4ade80' : 'none';
-		}
-		var btns = document.querySelectorAll('.__dqp_toolbar_btn');
-		for (var i = 0; i < btns.length; i++) {
-			var b = btns[i];
-			if (ACTIVE) {
-				b.style.background = 'rgba(34,197,94,0.22)';
-				b.style.borderColor = '#22c55e';
-				b.style.color = '#86efac';
-				b.innerHTML = '<span style="color:#22c55e;margin-right:4px;">●</span><span>选区中...</span>';
-			} else {
-				b.style.background = 'rgba(59,130,246,0.12)';
-				b.style.borderColor = '#3b82f6';
-				b.style.color = '#93c5fd';
-				b.innerHTML = '<span style="color:#60a5fa;margin-right:4px;">✦</span><span>选区代码</span>';
-			}
-		}
-	}
-
-	function onElementPicked(info) {
-		deactivatePick();
-		if (!info) return;
-
-		var ok = writeDraft(CTX, buildDraft(info));
-		if (ok) {
-			var label = (info.react && info.react.component)
-				? ('<' + info.react.component + ' />')
-				: (info.selector ? info.selector.slice(0, 36) : info.tag);
-			setStatus('✓ 已提取代码写入对话框：' + label);
-			setTimeout(function () { setStatus('选 区 代 码'); }, 3500);
-		} else {
-			setStatus('✗ 写入输入框失败：' + (LAST_ERR || '请确认当前在会话界面'), true);
-			setTimeout(function () { setStatus('选 区 代 码'); }, 4000);
-		}
-	}
-
-	// ── iframe 注入函数（处理同源与跨源 / 沙箱） ─────────────────────
-	async function injectIframeForPick(frame) {
-		// 1. 若同源且可直接访问 DOM，优先直接注入
-		try {
-			var doc = frame.contentDocument;
-			if (doc && (doc.body || doc.documentElement)) {
-				if (!doc.querySelector('script[data-dsh-quick-pick]')) {
-					var sc = doc.createElement('script');
-					sc.setAttribute('data-dsh-quick-pick', '1');
-					sc.textContent = INJECT_SCRIPT;
-					(doc.body || doc.documentElement).appendChild(sc);
-				} else {
-					if (frame.contentWindow) {
-						frame.contentWindow.postMessage({ source: SRC, type: 'activate' }, '*');
-					}
-				}
-				frame.dataset.dqpActive = '1';
-				return true;
-			}
-		} catch (e) {
-			// 跨源或沙箱限制，进入代理重挂流程
-		}
-
-		// 2. 如果已经挂过 srcdoc，直接发消息唤醒，不重复重载
-		if (frame.dataset.dqpActive === '1') {
-			try {
-				if (frame.contentWindow) {
-					frame.contentWindow.postMessage({ source: SRC, type: 'activate' }, '*');
-					return true;
-				}
-			} catch (e2) {}
-		}
-
-		// 3. 多层策略获取 HTML
-		var src = frame.src || frame.getAttribute('src');
-		var rawHtml = '';
-		var baseHref = '';
-		var realUrl = decodeSidebarPath(src);
-
-		if (frame.srcdoc && frame.dataset.dqpActive !== '1') {
-			rawHtml = frame.srcdoc;
-			baseHref = window.location.href;
-		} else if (src && src !== 'about:blank') {
-			// Tier 1: 同源转发路径（dsh-app://app/... 自动带桌面认证并消除跨域头）
-			var appUrl = toAppUrl(src);
-			try {
-				var resp1 = await fetch(appUrl, { credentials: 'include' });
-				if (resp1.ok) {
-					rawHtml = await resp1.text();
-					baseHref = appUrl.replace(/[^/]*$/, '');
-				}
-			} catch (e1) {}
-
-			// Tier 2: 宿主本地直读接口（直接从磁盘读取或 node fetch，100% 不受沙箱/CORS 限制）
-			if (!rawHtml) {
-				try {
-					var hostFetchUrl = '/quick-pick/read-html?src=' + encodeURIComponent(src);
-					var resp2 = await fetch(hostFetchUrl);
-					if (resp2.ok) {
-						rawHtml = await resp2.text();
-						baseHref = toAppUrl(src).replace(/[^/]*$/, '');
-					}
-				} catch (e2) {}
-			}
-
-			// Tier 3: 原始地址直读
-			if (!rawHtml) {
-				try {
-					var resp3 = await fetch(src, { credentials: 'include' });
-					if (resp3.ok) {
-						rawHtml = await resp3.text();
-						baseHref = src.replace(/[^/]*$/, '');
-					}
-				} catch (e3) {}
-			}
-		}
-
-		if (!rawHtml) {
-			console.warn('[' + SRC + '] 未能获取 iframe HTML，无法注入选区探针 (src: ' + src + ')');
+	// 把某个文档设为「选区目标」并挂上监听。浮层预览帧与当前网页预览帧共用这条通路。
+	function attachToDoc(doc, label) {
+		detachFrame();
+		if (!doc || !doc.body) {
+			report('frame-unreadable', { label: label });
 			return false;
 		}
-
-		// 补齐 <base href="..."> 以保证页面的 CSS、图片与 JS 相对资源正常加载
-		var baseTag = '<base href="' + baseHref + '">';
-		if (!/<base\s/i.test(rawHtml)) {
-			if (/<head\b[^>]*>/i.test(rawHtml)) {
-				rawHtml = rawHtml.replace(/<head\b[^>]*>/i, function (m) { return m + baseTag; });
-			} else {
-				rawHtml = baseTag + rawHtml;
-			}
+		FRAME_DOC = doc;
+		doc.addEventListener('mouseover', onFrameOver, true);
+		doc.addEventListener('pointermove', onFrameOver, true);
+		doc.addEventListener('mouseout', onFrameOut, true);
+		doc.addEventListener('click', onFrameClick, true);
+		doc.addEventListener('keydown', onFrameKey, true);
+		report('frame-ready', { label: label, title: String(doc.title || '').slice(0, 80) });
+		if (AUTOPICK) {
+			AUTOPICK = false;
+			startPick();
 		}
-
-		// 拼接注入脚本与真实地址标识
-		var configTag = '<script data-dsh-quick-pick>window.__DSH_REAL_URL__ = ' + JSON.stringify(realUrl) + ';</' + 'script>';
-		var scriptTag = configTag + '<script data-dsh-quick-pick>' + INJECT_SCRIPT + '<' + '/script>';
-		if (rawHtml.includes('</body>')) {
-			rawHtml = rawHtml.replace('</body>', scriptTag + '</body>');
-		} else {
-			rawHtml += scriptTag;
-		}
-
-		frame.dataset.dqpOriginalSrc = src;
-		frame.dataset.dqpActive = '1';
-		frame.srcdoc = rawHtml;
 		return true;
 	}
 
-	async function activatePick() {
-		var frames = getTargetFrames();
-		if (frames.length === 0) {
-			setStatus('未检测到打开的网页（请先在右侧打开文件或浏览器）', true);
-			setTimeout(function () { setStatus('选 区 代 码'); }, 3500);
-			return;
+	// ── 注入到沙箱预览帧里的内联探针 ────────────────────────────────────
+	// 沙箱帧（opaque origin）宿主读不到 DOM，也注入不了函数；但把页面换成
+	// 「srcdoc 副本 + 内联脚本」后，脚本能在帧内运行并把选中的 XPath
+	// postMessage 回宿主（宿主已有 source=dsh-quick-pick / type=picked 的监听）。
+	var SANDBOX_PROBE_HTML = '<script data-dsh-quick-pick>(function(){' +
+		'if(window.__dqpProbe)return;window.__dqpProbe=1;' +
+		'var ov=null,hov=null,on_=false;' +
+		'function box(){if(ov)return ov;ov=document.createElement("div");ov.id="__dqp_probe_hl";' +
+		'ov.style.cssText="position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #3b82f6;background:rgba(59,130,246,.18);border-radius:3px;box-sizing:border-box;display:none;";' +
+		'(document.body||document.documentElement).appendChild(ov);return ov;}' +
+		'function xp(el){if(!el||el.nodeType!==1)return"";var t=el.tagName.toLowerCase();if(t==="html")return"/html";if(t==="body")return"/html/body";' +
+		'var s=[],c=el;while(c&&c.nodeType===1){var n=c.tagName.toLowerCase();if(n==="html")break;if(n==="body"){s.unshift("body");break;}' +
+		'var i=1,p=c.parentElement;if(p){var k=p.children;for(var j=0;j<k.length;j++){if(k[j]===c)break;if(k[j].tagName&&k[j].tagName.toLowerCase()===n)i++;}}' +
+		's.unshift(n+"["+i+"]");c=p;}return"/html/"+s.join("/");}' +
+		'function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;hov=el;var b=box(),r=el.getBoundingClientRect();' +
+		'b.style.display=(r.width||r.height)?"block":"none";b.style.left=r.left+"px";b.style.top=r.top+"px";b.style.width=r.width+"px";b.style.height=r.height+"px";}' +
+		'function onClick(e){if(!hov)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
+		'var x=xp(hov);try{window.parent.postMessage({source:"dsh-quick-pick",type:"picked",payload:{xpath:x}},"*");}catch(err){}off();}' +
+		'function onKey(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();off();try{window.parent.postMessage({source:"dsh-quick-pick",type:"cancel"},"*");}catch(err){}}}' +
+		'function off(){on_=false;hov=null;document.removeEventListener("mouseover",onOver,true);document.removeEventListener("click",onClick,true);document.removeEventListener("keydown",onKey,true);' +
+		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();}' +
+		'function on(){if(on_)return;on_=true;var s=document.getElementById("__dqp_probe_cursor");' +
+		'if(!s){s=document.createElement("style");s.id="__dqp_probe_cursor";s.textContent="*,* *{cursor:crosshair !important;}";(document.head||document.documentElement).appendChild(s);}' +
+		'document.addEventListener("mouseover",onOver,true);document.addEventListener("click",onClick,true);document.addEventListener("keydown",onKey,true);}' +
+		'window.addEventListener("message",function(ev){var d=ev.data;if(!d||d.source!=="dsh-quick-pick")return;' +
+		'if(d.type==="cancel"||d.type==="exit")off();else if(d.type==="activate")on();});' +
+		'if(document.body||document.documentElement)on();else document.addEventListener("DOMContentLoaded",on);' +
+		'})();<\/script>';
+
+	// 退出选区：宿主侧状态 + 目标帧样式 + 沙箱探针 + web-review 开关，全部复位
+	function exitPickMode() {
+		var wasPreview = PREVIEW_PICKING;
+		stopPick(true);                 // 清宿主侧的浮层/同源帧选区
+		setEntryPicking(false);
+
+		if (FRAME_DOC) {
+			try {
+				var st = FRAME_DOC.getElementById(CURSOR_ID);
+				if (st) st.remove();
+				var hl = FRAME_DOC.getElementById(HILITE_ID);
+				if (hl) hl.style.display = 'none';
+			} catch (e) {}
 		}
+		detachFrame();
 
-		ACTIVE = true;
-		syncUI();
-		setStatus('正在启动选区探针...');
-
-		var successCount = 0;
+		// 通知页面内的探针退出（含跨源/沙箱帧）
+		var frames = document.querySelectorAll('iframe');
 		for (var i = 0; i < frames.length; i++) {
-			var frame = frames[i];
-			if (frame.type === 'webview') {
-				var wv = frame.element;
-				if (!wv.__dshPickListenerAttached) {
-					wv.__dshPickListenerAttached = true;
-					wv.addEventListener('console-message', function (e) {
-						if (e.message && e.message.startsWith('__DSH_PICK__:')) {
-							try {
-								var data = JSON.parse(e.message.slice('__DSH_PICK__:'.length));
-								onElementPicked(data);
-							} catch (err) {}
-						}
-					});
-				}
-				wv.executeJavaScript(INJECT_SCRIPT).catch(function (err) {
-					console.warn('[' + SRC + '] executeJavaScript failed:', err);
-				});
-				successCount++;
-			} else if (frame.type === 'iframe') {
-				var ok = await injectIframeForPick(frame.element);
-				if (ok) successCount++;
+			try {
+				frames[i].contentWindow.postMessage({ source: SRC, type: 'cancel' }, '*');
+			} catch (e) {}
+		}
+
+		// web-review 的选区开关是 toggle，再点一次即退出
+		if (wasPreview) {
+			var rbtn = findPreviewPickButton();
+			if (rbtn && !rbtn.disabled) {
+				try { rbtn.click(); } catch (e) {}
 			}
 		}
 
-		if (successCount > 0) {
-			setStatus('选区中：移动鼠标高亮，点击提取代码（Esc 取消）');
-		} else {
-			ACTIVE = false;
-			syncUI();
-			setStatus('✗ 选区启动失败：未能加载目标页面内容', true);
-			setTimeout(function () { setStatus('选 区 代 码'); }, 4000);
-			return;
-		}
-
-		// webview 轮询兜底
-		if (pollTimer) clearInterval(pollTimer);
-		pollTimer = setInterval(async function () {
-			if (!ACTIVE) {
-				clearInterval(pollTimer);
-				return;
-			}
-			var curFrames = getTargetFrames();
-			for (var j = 0; j < curFrames.length; j++) {
-				if (curFrames[j].type === 'webview') {
-					try {
-						var res = await curFrames[j].element.executeJavaScript('window.__DSH_PICK_RESULT__ || null');
-						if (res) {
-							await curFrames[j].element.executeJavaScript('window.__DSH_PICK_RESULT__ = null');
-							if (res === '__CANCEL__') {
-								deactivatePick();
-							} else if (typeof res === 'object') {
-								onElementPicked(res);
-							}
-							break;
-						}
-					} catch (e) {}
-				}
-			}
-		}, 100);
+		report('pick-exit', { wasPreview: wasPreview });
+		showToast('已退出选区模式', false);
 	}
 
-	function deactivatePick() {
-		ACTIVE = false;
-		if (pollTimer) {
-			clearInterval(pollTimer);
-			pollTimer = null;
+	// 沙箱/跨源帧：取原文 → 注入探针 → srcdoc 重挂（副本与宿主同源，脚本可运行）
+	//
+	// 取原文必须走 host 端代理：预览帧的 src 是 dsh-app:// 协议（或跨源），
+	// 在页面里 fetch(src) 拿不到内容；host 端的 /quick-pick/read-html 能直接
+	// 读磁盘（/sidebar/html/... 预览路由）或回源取页。
+	//
+	// 另外 DSH 的预览会把它重置回原 src，所以要记住"这个页面已切过副本"，
+	// 否则每次点选区都会重挂一次、页面来回闪（用户报的"一跳一跳"）。
+	// 取回预览页原文：桌面端窗口本身是 dsh-app:// 协议，相对路径到不了 host，
+	// 所以逐通道尝试（相对 → 当前 origin → 本机端口）。
+	function fetchPageHtml(src, cb) {
+		var qs = '/quick-pick/read-html?src=' + encodeURIComponent(src);
+		var bases = [''];
+		try {
+			if (location.origin && location.origin.indexOf('http') === 0) bases.push(location.origin);
+		} catch (e) {}
+		bases.push('http://127.0.0.1:19387');
+
+		var i = 0;
+		var tryNext = function () {
+			if (i >= bases.length) {
+				cb(new Error('所有取页通道都失败'));
+				return;
+			}
+			var url = bases[i++] + qs;
+			fetch(url, { credentials: 'omit' })
+				.then(function (r) {
+					if (!r.ok) throw new Error('HTTP ' + r.status + ' @' + url.slice(0, 40));
+					return r.text();
+				})
+				.then(function (t) {
+					if (!t || !t.trim()) throw new Error('取回内容为空');
+					cb(null, t);
+				})
+				.catch(function () { tryNext(); });
+		};
+		tryNext();
+	}
+
+	function injectSandboxFrame(frame) {
+		var src = frame.getAttribute('src') || '';
+		if (!src) return false;
+
+		// 已经是选区副本（srcdoc 还在）→ 直接重新激活探针，不重载页面
+		var isCopy = false;
+		try { isCopy = !!frame.getAttribute('srcdoc'); } catch (e) {}
+		if (isCopy) {
+			try { frame.contentWindow.postMessage({ source: SRC, type: 'activate' }, '*'); } catch (e) {}
+			setEntryPicking(true);
+			report('sandbox-activate', { src: src.slice(0, 80) });
+			return true;
 		}
-		var frames = getTargetFrames();
-		for (var i = 0; i < frames.length; i++) {
-			if (frames[i].type === 'webview') {
-				try {
-					frames[i].element.executeJavaScript('window.__dshCancelPick && window.__dshCancelPick()');
-				} catch (e) {}
-			} else if (frames[i].type === 'iframe') {
-				try {
-					if (frames[i].element.contentWindow) {
-						frames[i].element.contentWindow.postMessage({ source: 'dsh-quick-pick', type: 'cancel' }, '*');
-					}
-				} catch (e2) {}
+
+		// 短时防抖：连点不要重复取页
+		var now = Date.now();
+		if (INJECTED_PAGE_SRCS[src] && now - INJECTED_PAGE_SRCS[src] < 3000) {
+			report('sandbox-inject-debounce', { src: src.slice(0, 80) });
+			return true;
+		}
+		INJECTED_PAGE_SRCS[src] = now;
+
+		fetchPageHtml(src, function (err, html) {
+			if (err) {
+				var msg = String((err && err.message) || err);
+				delete INJECTED_PAGE_SRCS[src];
+				report('sandbox-inject', { ok: false, error: msg });
+				reportToDraft('预览页取回失败', { src: src.slice(0, 140), error: msg });
+				return;
+			}
+			try {
+				var base = src.replace(/[^/]*$/, '');
+				var inject = '<base href="' + base.replace(/"/g, '&quot;') + '">' + SANDBOX_PROBE_HTML;
+				var out = /<head\b[^>]*>/i.test(html)
+					? html.replace(/<head\b[^>]*>/i, function (m) { return m + inject; })
+					: inject + html;
+				frame.dataset.dqpInjected = '1';
+				frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+				frame.srcdoc = out;
+				setEntryPicking(true);
+				showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath', false);
+				report('sandbox-inject', { ok: true, src: src.slice(0, 90) });
+			} catch (e) {
+				report('sandbox-inject', { ok: false, error: 'inject: ' + e });
+			}
+		});
+		return true;
+	}
+
+	// ── 直接在当前网页预览帧里选区 ─────────────────────────────────────
+	// 依次尝试三条通道，全部不新开任何窗口：
+	//   1) 同源可读的 iframe → 宿主直接挂监听
+	//   2) Electron <webview> → executeJavaScript 注入探针
+	//   3) 沙箱 iframe → srcdoc 副本 + 内联探针
+	function pickInPageFrame() {
+		var list = document.querySelectorAll('iframe');
+		var sandboxCandidates = [];
+		for (var i = 0; i < list.length; i++) {
+			var f = list[i];
+			if (!f.offsetWidth || !f.offsetHeight) continue;
+			if (f.offsetWidth < 120 || f.offsetHeight < 120) continue;
+			if (PANEL && PANEL.contains(f)) continue;
+
+			var doc = null;
+			try { doc = f.contentDocument; } catch (e) { doc = null; }
+			if (doc && doc.body) {
+				if (attachToDoc(doc, 'page-frame')) {
+					report('page-frame-pick', { ok: true, how: 'same-origin', src: String(f.getAttribute('src') || '').slice(0, 100) });
+					startPick();
+					return true;
+				}
+			}
+			sandboxCandidates.push(f);
+		}
+
+		var wvs = document.querySelectorAll('webview');
+		for (var k = 0; k < wvs.length; k++) {
+			var wv = wvs[k];
+			if (!wv.offsetWidth || wv.offsetHeight < 120) continue;
+			if (typeof wv.executeJavaScript !== 'function') continue;
+			try {
+				wv.executeJavaScript(SANDBOX_PROBE_HTML.replace(/^<script[^>]*>/, '').replace(/<\/script>$/, ''));
+				setEntryPicking(true);
+				showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath', false);
+				report('page-frame-pick', { ok: true, how: 'webview' });
+				return true;
+			} catch (e) {}
+		}
+
+		for (var m = 0; m < sandboxCandidates.length; m++) {
+			var cand = sandboxCandidates[m];
+			// 沙箱开着时只能靠副本选区：页面会重载一次。关掉沙箱就没有这一步。
+			showToast('沙箱预览需切换为选区副本（会闪一下）；关掉沙箱（Temporarily disable）可避免闪动', false);
+			if (injectSandboxFrame(cand)) {
+				report('page-frame-pick', { ok: true, how: 'sandbox-inject', src: String(cand.getAttribute('src') || '').slice(0, 100) });
+				return true;
 			}
 		}
-		syncUI();
-		setStatus('选 区 代 码');
+
+		report('page-frame-pick', { ok: false, candidates: sandboxCandidates.length });
+		return false;
+	}
+
+	// ── 选区开关 ───────────────────────────────────────────────────────
+	function setCrosshair(on) {
+		if (!FRAME_DOC) return;
+		var st = FRAME_DOC.getElementById(CURSOR_ID);
+		if (on) {
+			if (!st) {
+				st = FRAME_DOC.createElement('style');
+				st.id = CURSOR_ID;
+				st.textContent = '*, * *{cursor:crosshair !important;}';
+				(FRAME_DOC.head || FRAME_DOC.documentElement).appendChild(st);
+			}
+		} else if (st) {
+			try { st.remove(); } catch (e) {}
+		}
+	}
+
+	function startPick() {
+		if (!FRAME_DOC) {
+			showToast('页面还没就绪：请先打开网页预览，等页面加载出来再点', true);
+			return;
+		}
+		PICKING = true;
+		setCrosshair(true);
+		updatePickButton();
+		setStatus('选区已开启：鼠标移到元素上高亮，点击即提取 Full XPath（Esc 取消）');
+		report('pick-start', { url: currentUrl() });
+	}
+
+	function stopPick(silent) {
+		PICKING = false;
+		clearHilite();
+		setCrosshair(false);
+		updatePickButton();
+		if (!silent) setStatus('选区已关闭');
 	}
 
 	function togglePick() {
-		if (ACTIVE) deactivatePick();
-		else activatePick();
+		if (PICKING) stopPick();
+		else startPick();
 	}
 
-	// ── 监听 iframe / 页面发出的 postMessage ────────────────────────
-	window.addEventListener('message', function (ev) {
-		var d = ev.data || {};
-		if (d.source !== SRC) return;
-		if (d.type === 'cancel') {
-			deactivatePick();
+	// ── 选中回调 ───────────────────────────────────────────────────────
+	function onPicked(el) {
+		var xpath = fullXPath(el);
+		stopPick(true);
+		if (!xpath) {
+			showToast('✗ 未能提取 XPath', true);
 			return;
 		}
-		if (d.type === 'picked' && d.payload) {
-			onElementPicked(d.payload);
+		var ok = writeDraft(CTX, xpath);
+		if (ok) {
+			showToast('✓ 已填入 Full XPath：' + xpath, false);
+			setStatus('已填入输入框：' + xpath);
+		} else {
+			showToast('✗ 填入输入框失败：' + (LAST_ERR || '未知原因'), true);
+			setStatus('填入输入框失败：' + (LAST_ERR || ''), true);
+		}
+		report('picked', { xpath: xpath, tag: el.tagName ? el.tagName.toLowerCase() : '', ok: ok });
+	}
+
+	// ── 面板 ───────────────────────────────────────────────────────────
+	function lastUrl() {
+		try { return sessionStorage.getItem(URL_KEY) || ''; } catch (e) { return ''; }
+	}
+
+	// 尽力从当前预览地址栏读目标网址；读不到则用上次的
+	function currentUrl() {
+		var inputs = findAddressInputs();
+		for (var i = 0; i < inputs.length; i++) {
+			var v = (inputs[i].value || '').trim();
+			if (v && /^https?:\/\//i.test(v)) return v;
+		}
+		return lastUrl();
+	}
+
+	function withBase(html, url) {
+		var base;
+		try {
+			var u = new URL(url, location.href);
+			base = u.origin + u.pathname.replace(/[^/]*$/, '');
+		} catch (e) {
+			return html;
+		}
+		if (/<base\s/i.test(html)) return html;
+		var tag = '<base href="' + base.replace(/"/g, '&quot;') + '">';
+		if (/<head\b[^>]*>/i.test(html)) {
+			return html.replace(/<head\b[^>]*>/i, function (m) { return m + tag; });
+		}
+		return tag + html;
+	}
+
+	function loadUrl(url) {
+		if (!url) {
+			setStatus('请先填网址，例如 http://127.0.0.1:8765/index.html', true);
+			return;
+		}
+		// 打开浮层就是为了选区：加载完成后自动进入选区
+		AUTOPICK = true;
+		setStatus('加载中…');
+		try { sessionStorage.setItem(URL_KEY, url); } catch (e) {}
+
+		fetch('/quick-pick/read-html?src=' + encodeURIComponent(url), { credentials: 'omit' })
+			.then(function (r) {
+				if (!r.ok) throw new Error('HTTP ' + r.status);
+				return r.text();
+			})
+			.then(function (html) {
+				if (!html || !html.trim()) throw new Error('返回内容为空');
+				stopPick(true);
+				detachFrame();
+				FRAME.srcdoc = withBase(html, url);
+			})
+			.catch(function (err) {
+				setStatus('加载失败：' + (err && err.message ? err.message : err), true);
+				report('load-failed', { url: url, error: String(err && err.message || err) });
+			});
+	}
+
+	function createPanel() {
+		if (PANEL) return PANEL;
+
+		PANEL = document.createElement('div');
+		PANEL.id = PANEL_ID;
+		PANEL.style.cssText =
+			'position:fixed;right:18px;top:64px;bottom:64px;width:min(62vw,880px);z-index:2147483645;' +
+			'display:flex;flex-direction:column;background:#0b1220;border:1px solid #1e293b;border-radius:12px;' +
+			'box-shadow:0 18px 48px rgba(0,0,0,.55);overflow:hidden;' +
+			'font:13px/1.45 -apple-system,system-ui,sans-serif;color:#e2e8f0;';
+		PANEL.innerHTML = [
+			'<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#111a2e;border-bottom:1px solid #1e293b;flex:none;">',
+			'  <span style="color:#60a5fa;font-weight:700;flex:none;">✦ XPath 选区</span>',
+			'  <input id="' + URL_ID + '" type="text" spellcheck="false" placeholder="输入网址，如 http://127.0.0.1:8765/index.html"',
+			'    style="flex:1;min-width:0;height:28px;padding:0 10px;border-radius:6px;border:1px solid #334155;background:#0b1220;color:#e2e8f0;font:12px/1 -apple-system,system-ui,sans-serif;outline:none;">',
+			'  <button id="' + OPEN_BTN_ID + '" type="button" style="flex:none;height:28px;padding:0 12px;border-radius:6px;border:1px solid #3b82f6;background:rgba(59,130,246,0.18);color:#93c5fd;font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;">打开</button>',
+			'  <button id="' + PICK_BTN_ID + '" type="button" style="flex:none;height:28px;padding:0 12px;border-radius:6px;border:1px solid #3b82f6;background:rgba(59,130,246,0.12);color:#93c5fd;font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;">选区 (XPath)</button>',
+			'  <button id="' + CLOSE_BTN_ID + '" type="button" title="关闭面板" style="flex:none;width:28px;height:28px;border-radius:6px;border:1px solid #334155;background:transparent;color:#94a3b8;font:600 13px/1 -apple-system,system-ui,sans-serif;cursor:pointer;">✕</button>',
+			'</div>',
+			'<div id="' + STATUS_ID + '" style="flex:none;padding:6px 10px;background:#0f172a;border-bottom:1px solid #1e293b;color:#94a3b8;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">正在准备…</div>',
+			'<iframe id="' + FRAME_ID + '" sandbox="allow-same-origin" title="选区页面"',
+			'  style="flex:1;width:100%;border:0;background:#fff;"></iframe>'
+		].join('');
+
+		document.body.appendChild(PANEL);
+
+		FRAME = $(FRAME_ID);
+		FRAME.addEventListener('load', onFrameLoad);
+
+		$(OPEN_BTN_ID).addEventListener('click', function () { loadUrl(($(URL_ID).value || '').trim()); });
+		$(URL_ID).addEventListener('keydown', function (e) {
+			if (e.key === 'Enter') {
+				e.preventDefault();
+				loadUrl(($(URL_ID).value || '').trim());
+			}
+		});
+		$(PICK_BTN_ID).addEventListener('click', function () { togglePick(); });
+		$(CLOSE_BTN_ID).addEventListener('click', function () { closePanel(); });
+
+		return PANEL;
+	}
+
+	function updatePickButton() {
+		renderToolbarButtons();
+		var btn = $(PICK_BTN_ID);
+		if (btn) {
+			btn.textContent = PICKING ? '选区中… (Esc)' : '选区 (XPath)';
+			btn.style.background = PICKING ? 'rgba(34,197,94,0.22)' : 'rgba(59,130,246,0.12)';
+			btn.style.borderColor = PICKING ? '#22c55e' : '#3b82f6';
+			btn.style.color = PICKING ? '#86efac' : '#93c5fd';
+		}
+	}
+
+	function openPanel(url) {
+		createPanel();
+		var input = $(URL_ID);
+		if (input && url && !input.value) input.value = url;
+		var target = (url || (input && input.value) || lastUrl() || '').trim();
+		if (target) loadUrl(target);
+		else setStatus('填入 demo 网址后点「打开」，再点「选区」即可点选元素');
+
+		report('panel-open', { url: target });
+		probeDom();
+	}
+
+	function closePanel() {
+		stopPick(true);
+		detachFrame();
+		if (FRAME) {
+			try { FRAME.removeEventListener('load', onFrameLoad); } catch (e) {}
+			try { FRAME.srcdoc = ''; } catch (e) {}
+		}
+		if (PANEL && PANEL.parentNode) PANEL.parentNode.removeChild(PANEL);
+		PANEL = null;
+		FRAME = null;
+		report('panel-close');
+	}
+
+	// ── DOM 诊断：搞不清宿主结构时，把候选地址栏与关键标记上报到日志 ──────
+	function probeDom() {
+		try {
+			var rows = [];
+			var nodes = document.querySelectorAll('input, textarea');
+			for (var i = 0; i < nodes.length && i < 40; i++) {
+				var el = nodes[i];
+				rows.push({
+					tag: el.tagName.toLowerCase(),
+					type: el.getAttribute('type') || '',
+					ph: String(el.getAttribute('placeholder') || '').slice(0, 40),
+					cls: String(el.className || '').slice(0, 60),
+					inWV: !!(el.closest && el.closest('[data-webview-ui]')),
+					vis: !!(el.offsetWidth || el.offsetHeight)
+				});
+			}
+			var btnList = [];
+			try { btnList = probePickCandidates().buttons || []; } catch (e) {}
+			report('dom-probe', {
+				inputs: rows,
+				marks: {
+					webviewUi: document.querySelectorAll('[data-webview-ui]').length,
+					sidebarRightToggle: document.querySelectorAll('[data-sidebar-right-toggle]').length,
+					iframes: document.querySelectorAll('iframe').length,
+					webviews: document.querySelectorAll('webview').length
+				},
+				buttons: btnList
+			});
+		} catch (e) {}
+	}
+
+	// 首次加载时提示一次入口位置
+	function announceOnce() {
+		try {
+			if (sessionStorage.getItem('dsh-quick-pick:announced') === '1') return;
+			sessionStorage.setItem('dsh-quick-pick:announced', '1');
+		} catch (e) {}
+		setTimeout(function () {
+			showToast('XPath 选区已就绪：在「网页预览」工具栏上点「选区 (XPath)」，再点网页元素即可', false);
+		}, 1800);
+	}
+
+	// ── 文件预览（HTML 预览）工具栏入口 ────────────────────────────────
+	// 就是截图里显示「Sandbox mode: on … Temporarily disable (unsafe)」的那一行，
+	// 属于右侧预览区自己的工具栏（不是对话区的卡片工具栏）。
+	function findFilePreviewToolbar() {
+		var btns = document.querySelectorAll('button, [role="button"]');
+		for (var i = 0; i < btns.length; i++) {
+			var b = btns[i];
+			var label = (b.getAttribute('aria-label') || '') + ' ' + (b.title || '') + ' ' + (b.textContent || '');
+			if (!/temporarily disable|sandbox|沙箱|临时关闭|临时禁用/i.test(label)) continue;
+			var bar = b.parentElement;
+			if (bar) return bar;
+		}
+		// 退而求其次：含「预览 / 编辑」切换的那一行
+		var pv = document.querySelectorAll('button, [role="button"]');
+		for (var j = 0; j < pv.length; j++) {
+			var p = pv[j];
+			var l2 = (p.getAttribute('aria-label') || '') + ' ' + (p.title || '') + ' ' + (p.textContent || '');
+			if (!/^(预览|编辑|preview|edit)$/i.test(l2.trim())) continue;
+			if (p.parentElement && p.parentElement.parentElement) return p.parentElement.parentElement;
+		}
+		return null;
+	}
+
+	// 工具栏按钮的统一外观（选区中 / 空闲）
+	function renderToolbarButtons() {
+		var on = PICKING || PREVIEW_PICKING;
+		var btns = document.querySelectorAll('.' + BTN_CLASS);
+		for (var i = 0; i < btns.length; i++) {
+			btns[i].innerHTML = on
+				? '<span style="color:#22c55e;margin-right:4px;">●</span><span>选区中…</span>'
+				: '<span style="color:#60a5fa;margin-right:4px;">✦</span><span>选区 (XPath)</span>';
+			btns[i].style.borderColor = on ? '#22c55e' : '#3b82f6';
+			btns[i].style.background = on ? 'rgba(34,197,94,0.22)' : 'rgba(59,130,246,0.12)';
+			btns[i].style.color = on ? '#86efac' : '#93c5fd';
+		}
+	}
+
+	// ── 工具栏按钮：只挂「右侧内置浏览器 / 网页预览」的地址栏所在工具栏 ────
+	// 内置浏览器（dsh-client-ui-sidebar-browser）的地址栏占位符是「输入 HTTP(S) 地址」，
+	// 类名形如 xxx_address / xxx_addressBox；web-review 的预览地址栏是「输入网址…」。
+	// 两者都要认，但绝不往常规对话区的任何工具栏里挂。
+	function findAddressInputs() {
+		var all = document.querySelectorAll(
+			'input[placeholder*="HTTP"], input[placeholder*="网址"], input[placeholder*="URL" i], input[placeholder*="url"], ' +
+			'input[placeholder*="address" i], input[class*="address" i], [class*="addressBox"] input, ' +
+			'[data-webview-ui] input, [data-webview-ui] textarea'
+		);
+		var out = [];
+		for (var i = 0; i < all.length; i++) {
+			// 浮层自己的地址栏不算挂载点，否则会再长出一个「错误入口」
+			if (PANEL && PANEL.contains(all[i])) continue;
+			out.push(all[i]);
+		}
+		return out;
+	}
+
+	function createToolbarButton() {
+		var btn = document.createElement('button');
+		btn.className = BTN_CLASS;
+		btn.type = 'button';
+		btn.title = 'XPath 选区：在当前网页上点选元素，把 Full XPath 填进输入框 (Cmd/Ctrl+Shift+E)';
+		btn.style.cssText =
+			'display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:6px;' +
+			'font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;border:1px solid #3b82f6;' +
+			'background:rgba(59,130,246,0.12);color:#93c5fd;flex:none;margin-left:6px;margin-right:4px;' +
+			'transition:all 0.15s;user-select:none;';
+		btn.innerHTML = '<span style="color:#60a5fa;margin-right:4px;">✦</span><span>选区 (XPath)</span>';
+
+		btn.addEventListener('mouseenter', function () {
+			if (!PICKING) this.style.background = 'rgba(59,130,246,0.24)';
+		});
+		btn.addEventListener('mouseleave', function () {
+			if (!PICKING) this.style.background = 'rgba(59,130,246,0.12)';
+		});
+		btn.addEventListener('click', function (e) {
+			e.preventDefault();
+			e.stopPropagation();
+			startPreviewPick();
+		});
+		return btn;
+	}
+
+	function injectToolbarButtons() {
+		// 右侧预览区两种形态，各自挂各自那一行（互不冲突）：
+		//   1) HTML 文件预览 → 沙箱提示条那一行
+		//   2) 内置浏览器 → 地址栏那一行
+		var previewBar = findFilePreviewToolbar();
+		if (previewBar && !previewBar.querySelector('.' + BTN_CLASS)) {
+			previewBar.appendChild(createToolbarButton());
+			report('file-preview-entry', { cls: String(previewBar.className || '').slice(0, 40) });
+		}
+
+		var inputs = findAddressInputs();
+		if (inputs.length !== LAST_INPUT_COUNT) {
+			LAST_INPUT_COUNT = inputs.length;
+			var samples = [];
+			for (var s = 0; s < inputs.length && s < 6; s++) {
+				samples.push({
+					ph: String(inputs[s].getAttribute('placeholder') || '').slice(0, 40),
+					cls: String(inputs[s].className || '').slice(0, 60),
+					inWV: !!(inputs[s].closest && inputs[s].closest('[data-webview-ui]'))
+				});
+			}
+			report('address-inputs', { count: inputs.length, samples: samples });
+		}
+		for (var i = 0; i < inputs.length; i++) {
+			var input = inputs[i];
+			var bar = input.parentElement;
+			if (!bar) continue;
+			if (bar.querySelector('.' + BTN_CLASS)) continue;
+			if (input.nextSibling) bar.insertBefore(createToolbarButton(), input.nextSibling);
+			else bar.appendChild(createToolbarButton());
+		}
+		pruneStrayButtons();
+	}
+
+	// 清掉历史上挂到别处的按钮（"错误的入口"）
+	// 判断口径与注入完全一致：只保留挂在候选地址栏容器里的按钮。
+	function pruneStrayButtons() {
+		var bars = [];
+		var inputs = findAddressInputs();
+		for (var i = 0; i < inputs.length; i++) {
+			var parent = inputs[i].parentElement;
+			if (parent && bars.indexOf(parent) < 0) bars.push(parent);
+		}
+		var fpb = findFilePreviewToolbar();
+		if (fpb && bars.indexOf(fpb) < 0) bars.push(fpb);
+
+		var btns = document.querySelectorAll('.' + BTN_CLASS);
+		for (var j = 0; j < btns.length; j++) {
+			var btn = btns[j];
+			if (bars.indexOf(btn.parentElement) >= 0) continue;
+			report('prune-stray-button', { cls: btn.parentElement ? String(btn.parentElement.className).slice(0, 60) : '' });
+			try { btn.remove(); } catch (e) {}
+		}
+	}
+
+	// ── 兼容：其它预览体系（dsh-browser 等）的选区消息 ──────────────────
+	window.addEventListener('message', function (ev) {
+		var d = ev.data;
+		if (!d || typeof d !== 'object') return;
+
+		// 1) web-review 的预览桥：用户在「当前网页」上点选后回传选中元素
+		if (d.protocol === 'dsh-web-review/bridge' && d.direction === 'frame-to-host' && d.event) {
+			if (d.event.name === 'cancel-pick') {
+				setEntryPicking(false);
+				return;
+			}
+			if (d.event.name !== 'pick') return;
+
+			setEntryPicking(false);
+			var snap = (d.event.payload && d.event.payload.target && d.event.payload.target.snapshot) || {};
+			// fullPath / cssPath 都是 CSS 形式，需要翻成 XPath
+			var css = snap.fullPath || snap.cssPath || '';
+			var xp = convertSelectorToXPath(css, snap.tagName);
+			if (xp) {
+				var wok = writeDraft(CTX, xp);
+				showToast(wok ? ('✓ 已填入 Full XPath：' + xp) : ('✗ 填入输入框失败：' + LAST_ERR), !wok);
+				report('picked', { source: 'web-review', xpath: xp, css: css, ok: wok });
+			}
+			return;
+		}
+
+		// 2) dsh-browser 的 review 桥
+		if (d.source === 'dsh-browser' && d.kind === 'review-pick') {
+			var xp2 = d.xpath || (d.target && d.target.xpath) || '';
+			if (!xp2 && d.target && d.target.selector) xp2 = convertSelectorToXPath(d.target.selector, d.target.tagName);
+			if (xp2) {
+				var ok2 = writeDraft(CTX, xp2);
+				showToast(ok2 ? ('✓ 已填入 Full XPath：' + xp2) : ('✗ 填入失败：' + LAST_ERR), !ok2);
+			}
+			return;
+		}
+
+		// 3) 浮层探针
+		if (d.source === SRC && d.type === 'cancel') {
+			setEntryPicking(false);
+			return;
+		}
+		if (d.source === SRC && d.type === 'picked' && d.payload && d.payload.xpath) {
+			setEntryPicking(false);
+			var ok3 = writeDraft(CTX, d.payload.xpath);
+			showToast(ok3 ? ('✓ 已填入 Full XPath：' + d.payload.xpath) : ('✗ 填入失败：' + LAST_ERR), !ok3);
 		}
 	});
 
-	// ── 浏览器与预览工具栏自动注入「✦ 选区代码」按钮 ─────────────────
-	function injectToolbarButtons() {
-		var inputs = document.querySelectorAll(
-			'input[placeholder*="http" i], input[placeholder*="网址" i], input[placeholder*="URL" i], [class*="addressBox"] input, [class*="address"]'
-		);
-		for (var i = 0; i < inputs.length; i++) {
-			var input = inputs[i];
-			var bar = input.closest ? input.closest('form, [class*="toolbar"]') : input.parentElement;
-			if (!bar || bar.querySelector('.__dqp_toolbar_btn')) continue;
-
-			var btn = document.createElement('button');
-			btn.className = '__dqp_toolbar_btn';
-			btn.type = 'button';
-			btn.title = '选区代码：点击当前网页元素并提取代码到对话框 (快捷键: Cmd/Ctrl+Shift+E)';
-			btn.innerHTML = '<span style="color:#60a5fa;margin-right:4px;">✦</span><span>选区代码</span>';
-			btn.style.cssText =
-				'display:inline-flex;align-items:center;height:28px;padding:0 10px;border-radius:6px;' +
-				'font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;border:1px solid #3b82f6;' +
-				'background:rgba(59,130,246,0.12);color:#93c5fd;flex:none;margin-left:5px;transition:all 0.15s;';
-
-			btn.addEventListener('mouseenter', function () {
-				if (!ACTIVE) this.style.background = 'rgba(59,130,246,0.22)';
-			});
-			btn.addEventListener('mouseleave', function () {
-				if (!ACTIVE) this.style.background = 'rgba(59,130,246,0.12)';
-			});
-			btn.addEventListener('click', function (e) {
-				e.preventDefault();
-				e.stopPropagation();
-				togglePick();
-			});
-
-			bar.appendChild(btn);
-		}
-	}
-
-	// ── 右下角 HUD 状态栏 ─────────────────────────────────────────
-	function buildHud() {
-		if (HUD) return;
-		var d = document.createElement('div');
-		d.id = '__dqp_hud';
-		d.title = '网页选区代码提取 (快捷键: Cmd/Ctrl+Shift+E，Esc 取消)';
-		d.innerHTML = '<span class="dot"></span><span class="dqp-label">选 区 代 码</span>';
-		d.addEventListener('click', function (e) {
-			e.stopPropagation();
-			e.preventDefault();
-			togglePick();
-		});
-		['mousedown', 'mouseup', 'dblclick', 'pointerdown', 'pointerup'].forEach(function (ev) {
-			d.addEventListener(ev, function (e) { e.stopPropagation(); });
-		});
-		document.body.appendChild(d);
-		HUD = d;
-	}
-
-	// ── 初始化样式与观察器 ────────────────────────────────────────
+	// ── 初始化 ─────────────────────────────────────────────────────────
 	function initPlugin() {
-		var st = document.createElement('style');
-		st.id = '__dqp_style';
-		st.textContent =
-			'#__dqp_hud{position:fixed;right:14px;bottom:14px;z-index:2147483646;' +
-			'font:12px/1.5 -apple-system,system-ui,sans-serif;background:#1c1c1e;color:#fff;' +
-			'border-radius:10px;padding:9px 13px;box-shadow:0 6px 22px rgba(0,0,0,.35);' +
-			'display:flex;align-items:center;gap:9px;user-select:none;cursor:pointer;border:1px solid #333}' +
-			'#__dqp_hud .dot{width:8px;height:8px;border-radius:50%;background:#555;flex:none;transition:all 0.2s}' +
-			'#__dqp_hud.on .dot{background:#4ade80;box-shadow:0 0 8px #4ade80}' +
-			'#__dqp_hud:hover{background:#262628;border-color:#444}';
-		(document.head || document.documentElement).appendChild(st);
-
-		// 全局快捷键
 		document.addEventListener('keydown', function (e) {
-			if (e.key === 'Escape' && ACTIVE) {
+			if (e.key === 'Escape' && (PICKING || PREVIEW_PICKING)) {
 				e.stopPropagation();
-				deactivatePick();
+				exitPickMode();
 				return;
 			}
 			if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'E' || e.key === 'e')) {
 				e.preventDefault();
 				e.stopPropagation();
-				togglePick();
+				// 优先在当前网页上直接选区；只有在没有可用预览时才退回浮层
+				if (!startPreviewPick()) {
+					if (PANEL) closePanel();
+					else openPanel(currentUrl());
+				}
 			}
 		}, true);
 
-		// DOM 观察器：监控页面变化，自动为新打开的浏览器页签或预览页签挂载「选区代码」按钮
+		var pending = false;
 		var observer = new MutationObserver(function () {
-			injectToolbarButtons();
+			if (pending) return;
+			pending = true;
+			setTimeout(function () {
+				pending = false;
+				injectToolbarButtons();
+			}, 250);
 		});
-		observer.observe(document.body, { childList: true, subtree: true });
 
 		return {
 			name: SRC,
-			inject: ['sessions'],
 			apply: function (ctx) {
 				CTX = ctx;
 				var boot = function () {
 					if (!document.body) { setTimeout(boot, 200); return; }
-					buildHud();
 					injectToolbarButtons();
-					console.info('[' + SRC + '] ready — 点击浏览器工具栏「选区代码」或右下角 HUD 即可点选元素');
+					observer.observe(document.body, { childList: true, subtree: true });
+					report('ready', envInfo({ inputs: findAddressInputs().length }));
+					setTimeout(probeDom, 3000);
+					announceOnce();
 				};
 				boot();
 			}
 		};
 	}
 
-	// ── 模块加载 ────────────────────────────────────────────────
+	// ── 模块加载 ───────────────────────────────────────────────────────
 	if (typeof window.__ModuleLoader__ !== 'undefined' &&
 		typeof window.__ModuleLoader__.load === 'function') {
 		window.__ModuleLoader__.load({ id: SRC, factory: initPlugin });
@@ -904,7 +1221,7 @@
 				plugin.apply({
 					get: function () { return undefined; },
 					effect: function (fn) { try { fn(); } catch (e) {} },
-					on: function () {},
+					on: function () {}
 				});
 			} catch (e) { console.warn('[' + SRC + '] fallback apply failed:', e); }
 		}

@@ -1,9 +1,25 @@
 {
   "name": "dsh-quick-pick",
-  "version": "1.0.0",
-  "description": "极简选区插件：在当前 Web GUI 界面上点选任意元素，元素的定位信息（选择器 / 文字 / 样式 / HTML 片段）直接写入对话输入框。无预览面板、无地址栏、无确认步骤。",
+  "version": "1.1.0",
+  "description": "DeepSeek Harness 网页选区插件：在右侧预览区（文件预览 / 内置浏览器）的工具栏上点「选区 (XPath)」，直接在网页上点选元素，Full XPath 自动写入会话输入框。",
   "type": "module",
   "main": "index.js",
+  "license": "MIT",
+  "author": "Robin <https://blog.wattflow.net>",
+  "homepage": "https://blog.wattflow.net",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/robin421/dsh-quick-pick.git"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "xpath",
+    "element-picker",
+    "web-preview"
+  ],
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

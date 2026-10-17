@@ -66,10 +66,14 @@ export function apply(ctx) {
 					let content = '';
 					let filePath = '';
 					// 1. 如果是 /sidebar/html/ 路由，直接从本地磁盘读
+					//    注意：这里的目标路径可能是「整段 URL 编码的绝对路径」
+					//    （例如 %2FVolumes%2F...%2Findex.html），解码后本身自带前导斜杠，
+					//    不能再补一个，否则会拼成 //Volumes/... 而读不到文件。
 					const m = /\/sidebar\/html\/[^/]+\/(.*)$/.exec(target);
 					if (m) {
 						const segs = m[1].split('/').filter(Boolean).map(decodeURIComponent);
-						filePath = '/' + segs.join('/');
+						const joined = segs.join('/');
+						filePath = /^[a-zA-Z]:\//.test(joined) || joined.startsWith('/') ? joined : '/' + joined;
 						const fs = await import('node:fs/promises');
 						content = await fs.readFile(filePath, 'utf-8');
 					} else {
@@ -123,6 +127,60 @@ export function apply(ctx) {
 				}
 			}
 		}), 'dsh-quick-pick: asset');
+
+		// 路由：诊断上报（client 端把关键事件 POST 过来，追加写入 ~/.dsh/logs/quick-pick.log）
+		// 桌面 GUI 无法直接观察，这里留一条落盘通道便于事后定位问题。
+		ctx.effect(() => webServer.register({
+			kind: 'exact',
+			path: '/quick-pick/log',
+			handler: async (req, res) => {
+				res.setHeader('access-control-allow-origin', req.headers.origin || '*');
+				res.setHeader('access-control-allow-methods', 'POST,OPTIONS');
+				res.setHeader('access-control-allow-headers', '*');
+				if (req.method === 'OPTIONS') {
+					res.writeHead(204);
+					res.end();
+					return;
+				}
+				if (req.method !== 'POST' && req.method !== 'GET') {
+					res.writeHead(405);
+					res.end();
+					return;
+				}
+				try {
+					const fs = await import('node:fs');
+					const os = await import('node:os');
+					const path = await import('node:path');
+					const dir = path.join(os.homedir(), '.dsh', 'logs');
+					fs.mkdirSync(dir, { recursive: true });
+
+					let line = '';
+					if (req.method === 'GET') {
+						// <img> 兜底通道：数据放在 query 里（桌面端某些沙箱下 POST 会被挡）
+						const u = new URL(req.url ?? '/', 'http://dsh.internal');
+						line = u.searchParams.get('event') + ' ' + (u.searchParams.get('payload') || '');
+					} else {
+						let body = '';
+						for await (const chunk of req) {
+							body += chunk;
+							if (body.length > 20000) break;
+						}
+						line = body || '(empty)';
+					}
+
+					fs.appendFileSync(
+						path.join(dir, 'quick-pick.log'),
+						new Date().toISOString() + ' ' + line.slice(0, 20000) + '\n',
+						'utf-8'
+					);
+					res.writeHead(204);
+					res.end();
+				} catch (err) {
+					res.writeHead(500, { 'content-type': 'application/json' });
+					res.end(JSON.stringify({ ok: false, error: String((err && err.message) || err) }));
+				}
+			}
+		}), 'dsh-quick-pick: log');
 	} catch (e) {
 		console.warn('[dsh-quick-pick] register routes failed:', e);
 	}
