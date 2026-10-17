@@ -1,0 +1,5 @@
+# dsh-quick-pick bundle patch: 把本插件挂进 profile。
+# 与 dsh-web-review / dsh-context 等同样走 bundle 层加载。
+- insert:
+    - id: dsh-quick-pick
+      name: 'dsh-quick-pick'

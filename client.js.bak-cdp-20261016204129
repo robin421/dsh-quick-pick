@@ -1,0 +1,477 @@
+// dsh-quick-pick — 极简选区插件（client 端）
+//
+// 目标：在**当前正在看的页面**上直接选区，不打开任何新窗口。
+//
+// 实现：宿主右侧边栏的「浏览器」页签用 iframe 直接加载目标 URL，
+// 且沙箱含 allow-same-origin（见 dsh-client-ui-sidebar-right 的
+// WEB_BROWSER_SANDBOX），所以外层可以读它的 DOM。开启后：
+//   1) 在该 iframe 内部注入选区脚本（悬停高亮 + 点击捕获）；
+//   2) 元素信息通过 postMessage 传回外层；
+//   3) 外层把它写进对话输入框（宿主官方 conversation.input.setDraft）。
+//
+// 跨源页面无法穿透时给出明确提示。
+//
+// 加载方式：宿主 __ModuleLoader__。
+
+(function () {
+	'use strict';
+
+	var SRC = 'dsh-quick-pick';
+	var MSG = 'dsh-quick-pick:pick';
+	var HUD = null;
+	var ACTIVE = false;
+	var LAST_ERR = '';
+	var CTX = null;
+
+	// ── 状态条 ──────────────────────────────────────────────
+	function injectStyle() {
+		if (document.getElementById('__dqp_style')) return;
+		var st = document.createElement('style');
+		st.id = '__dqp_style';
+		st.textContent =
+			'#__dqp_hud{position:fixed;right:14px;bottom:14px;z-index:2147483646;' +
+			'font:12px/1.5 -apple-system,system-ui,sans-serif;background:#1c1c1e;color:#fff;' +
+			'border-radius:10px;padding:9px 13px;box-shadow:0 6px 22px rgba(0,0,0,.35);' +
+			'display:flex;align-items:center;gap:9px;user-select:none;cursor:pointer;max-width:360px}' +
+			'#__dqp_hud .dot{width:8px;height:8px;border-radius:50%;background:#555;flex:none}' +
+			'#__dqp_hud.on .dot{background:#4ade80;box-shadow:0 0 8px #4ade80}' +
+			'#__dqp_hud b{color:#8fa5ff}';
+		(document.head || document.documentElement).appendChild(st);
+	}
+
+	function setStatus(html, isErr) {
+		if (!HUD) return;
+		var label = HUD.querySelector('span.dqp-label');
+		if (label) {
+			label.innerHTML = html;
+			label.style.color = isErr ? '#ff8b8b' : '';
+		}
+	}
+
+	// ── 定位当前页面的 iframe ───────────────────────────────
+	function frameReport() {
+		var all = document.querySelectorAll('iframe');
+		var out = [];
+		for (var i = 0; i < all.length; i++) {
+			var f = all[i];
+			out.push({
+				marker: f.dataset.sidebarBrowserFrame || '',
+				src: (f.src || '').slice(0, 70),
+				title: (f.title || '').slice(0, 30),
+				cls: (f.className || '').toString().slice(0, 40),
+				id: f.id || '',
+				hasDoc: !!f.contentDocument
+			});
+		}
+		return { total: all.length, list: out };
+	}
+
+	function findFrame() {
+		var all = document.querySelectorAll('iframe');
+		var fallback = null;
+
+		// 第一轮：宿主浏览器页签的标识属性
+		for (var i = 0; i < all.length; i++) {
+			if (all[i].dataset.sidebarBrowserFrame === 'iframe') return all[i];
+		}
+		// 第二轮：任何加载了 http(s) 的 iframe
+		for (var j = 0; j < all.length; j++) {
+			var f = all[j];
+			var src = f.src || '';
+			if (/^https?:\/\//i.test(src)) { if (!fallback) fallback = f; }
+		}
+		if (fallback) return fallback;
+		// 第三轮：任何能读到文档的 iframe（about:blank 也可能被宿主写过内容）
+		for (var k = 0; k < all.length; k++) {
+			var g = all[k];
+			try {
+				var d = g.contentDocument;
+				if (d && d.body && d.body.children.length > 0) return g;
+			} catch (e) {}
+		}
+		// 最后：第一个 iframe 也拿来试（至少能给出具体报错）
+		return all.length ? all[0] : null;
+	}
+
+	// [诊断] 点 HUD 时先输出一次 DOM 实况，便于定位选择器为何不命中
+	function diag() {
+		var rep = frameReport();
+		console.info('[dsh-quick-pick] iframe 实况:', JSON.stringify(rep, null, 1));
+		setStatus('iframe: ' + rep.total + ' 个（详情见控制台）');
+	}
+
+	// ── 注入到 iframe 内部的选区脚本 ─────────────────────────
+	function pickerSource() {
+		return '<' + 'script data-dqp-picker>' + '(function(){' +
+			'if(window.__dqpInjected)return;window.__dqpInjected=true;' +
+			'var ON=false,HOVER=null;' +
+			'var st=document.createElement("style");' +
+			'st.textContent=".__dqp_hover{outline:2px solid #4d6bfe !important;' +
+			'outline-offset:-2px;background:rgba(77,107,254,.10) !important;' +
+			'cursor:crosshair !important}";' +
+			'(document.head||document.documentElement).appendChild(st);' +
+			'function path(e){var parts=[],n=e;' +
+			'while(n&&n.nodeType===1&&n!==document.documentElement){' +
+			'var seg=n.tagName.toLowerCase();' +
+			'if(n.id){parts.unshift("#"+n.id);break}' +
+			'var i=1,sib=n;while((sib=sib.previousElementSibling)){if(sib.tagName===n.tagName)i++}' +
+			'if(i>1||n.nextElementSibling)seg+=":nth-of-type("+i+")";' +
+			'parts.unshift(seg);n=n.parentElement}' +
+			'if(n&&n.nodeType===1&&parts[0]&&parts[0].charAt(0)!=="#")parts.unshift(n.tagName.toLowerCase());' +
+			'return parts.join(" > ")}' +
+			'function desc(el){var cs=null;try{cs=getComputedStyle(el)}catch(e){}' +
+			'var r=null;try{r=el.getBoundingClientRect()}catch(e){}' +
+			'var keys=["display","position","width","height","color","backgroundColor",' +
+			'"fontSize","fontWeight","fontFamily","lineHeight","padding","margin","border",' +
+			'"borderRadius","textAlign","flexDirection","justifyContent","alignItems","gap","opacity"];' +
+			'var style={};for(var k of keys){var v=cs?cs[k]:"";' +
+			'if(v&&v!=="normal"&&v!=="none"&&v!=="auto"&&v!=="rgba(0, 0, 0, 0)"&&v!=="0px")style[k]=v}' +
+			'var h=el.outerHTML||"";if(h.length>3000)h=h.slice(0,3000)+"\\n...(truncated)";' +
+			'return{tag:el.tagName?el.tagName.toLowerCase():"",id:el.id||"",' +
+			'classes:Array.prototype.slice.call(el.classList||[]),selector:path(el),' +
+			'text:(el.innerText||el.textContent||"").trim().slice(0,800),html:h,style:style,' +
+			'rect:r?{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}:null,' +
+			'url:location.href}}' +
+			'function onOver(e){if(!ON)return;var t=e.target;' +
+			'if(!t||t.nodeType!==1)return;' +
+			'if(t===HOVER)return;' +
+			'if(HOVER)HOVER.classList.remove("__dqp_hover");' +
+			'HOVER=t;HOVER.classList.add("__dqp_hover")}' +
+			'function onClick(e){if(!ON)return;' +
+			'e.preventDefault();e.stopPropagation();' +
+			'var t=e.target;' +
+			'if(HOVER){HOVER.classList.remove("__dqp_hover");HOVER=null}' +
+			'var info=desc(t);' +
+			'ON=false;document.documentElement.style.cursor="";' +
+			'try{window.parent.postMessage({source:"' + MSG + '",info:info},"*")}catch(err){}' +
+			'document.removeEventListener("mouseover",onOver,true);' +
+			'document.removeEventListener("click",onClick,true)}' +
+			'window.addEventListener("message",function(ev){' +
+			'var d=ev.data||{};if(d.source!=="' + MSG + '")return;' +
+			'if(d.type!=="toggle")return;' +
+			'ON=!!d.on;' +
+			'if(ON){document.addEventListener("mouseover",onOver,true);' +
+			'document.addEventListener("click",onClick,true);' +
+			'document.documentElement.style.cursor="crosshair"}' +
+			'else{document.removeEventListener("mouseover",onOver,true);' +
+			'document.removeEventListener("click",onClick,true);' +
+			'document.documentElement.style.cursor="";' +
+			'if(HOVER){HOVER.classList.remove("__dqp_hover");HOVER=null}}});' +
+			'})();</' + 'script>';
+	}
+
+	function injectFrame(frame, on) {
+		try {
+			var doc = frame.contentDocument;
+			if (!doc) {
+				// 跨源（含 about:blank 外层、远程站点）时读不到文档。
+				return {
+					ok: false,
+					why: '当前页面与 DSH 不同源，浏览器安全策略禁止读取其内部内容'
+				};
+			}
+
+			var already = doc.querySelector('script[data-dqp-picker]');
+			if (!already) {
+				var holder = doc.createElement('div');
+				holder.innerHTML = pickerSource();
+				var anchor = doc.body || doc.documentElement;
+				while (holder.firstChild) anchor.appendChild(holder.firstChild);
+			}
+			setTimeout(function () {
+				try { frame.contentWindow.postMessage({ source: MSG, type: 'toggle', on: on }, '*'); } catch (e) {}
+			}, 60);
+			return { ok: true };
+		} catch (e) {
+			return { ok: false, why: '跨源页面无法穿透（' + (e && e.message ? e.message : e) + '）' };
+		}
+	}
+
+	// ── 跨源后备：走 host 的 CDP 取元素 ─────────────────────
+	function api(path, body) {
+		return fetch(path, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(body || {}),
+		}).then(function (r) { return r.json(); });
+	}
+
+	var CDP_SESSION = null;
+
+	function cdpLaunch(url) {
+		return api('/quick-pick/launch', { url: url }).then(function (r) {
+			if (!r || r.ok !== true) throw new Error((r && r.error) || 'launch 失败');
+			CDP_SESSION = r.sessionId;
+			return r.sessionId;
+		});
+	}
+
+	function cdpPick(x, y) {
+		return api('/quick-pick/element', { sessionId: CDP_SESSION, x: x, y: y }).then(function (r) {
+			if (!r || r.ok !== true) throw new Error((r && r.error) || '取元素失败');
+			return r.info;
+		});
+	}
+
+	function turnOffAll() {
+		var frames = document.querySelectorAll('iframe');
+		for (var i = 0; i < frames.length; i++) {
+			try { frames[i].contentWindow.postMessage({ source: MSG, type: 'toggle', on: false }, '*'); } catch (e) {}
+		}
+	}
+
+	// ── 生成给 AI 的定位信息 ────────────────────────────────
+	function buildDraft(info) {
+		var L = [];
+		L.push('【选中的页面元素】');
+		L.push('页面: ' + info.url);
+		L.push('选择器: ' + info.selector);
+		L.push('标签: <' + info.tag + '>' + (info.id ? '  id="' + info.id + '"' : '') +
+			(info.classes && info.classes.length ? '  class="' + info.classes.join(' ') + '"' : ''));
+		if (info.text) L.push('文字: ' + String(info.text).replace(/\n+/g, ' ').slice(0, 400));
+		if (info.rect) L.push('位置尺寸: ' + info.rect.w + '×' + info.rect.h + ' @ (' + info.rect.x + ',' + info.rect.y + ')');
+		var sks = Object.keys(info.style || {});
+		if (sks.length) {
+			L.push('关键样式:');
+			sks.forEach(function (k) { L.push('  ' + k + ': ' + info.style[k]); });
+		}
+		L.push('HTML:');
+		L.push('```html');
+		L.push(info.html);
+		L.push('```');
+		L.push('');
+		L.push('请修改这个元素：');
+		return L.join('\n');
+	}
+
+	// ── 写入输入框 ──────────────────────────────────────────
+	function writeDraft(ctx, text) {
+		var errs = [];
+		try {
+			var sessions = null;
+			try { sessions = ctx.get ? ctx.get('sessions') : null; } catch (e) {}
+			if (!sessions) { try { sessions = ctx.sessions; } catch (e) {} }
+			if (!sessions) { errs.push('sessions 不可用'); }
+			else {
+				var snap = null;
+				try { snap = sessions.list && sessions.list.getSnapshot ? sessions.list.getSnapshot() : null; } catch (e) {}
+				var cur = null;
+				if (snap && snap.byId) {
+					var ids = snap.ids || Object.keys(snap.byId);
+					for (var i = 0; i < ids.length; i++) {
+						var row = snap.byId[ids[i]];
+						if (row && row.retainedBy && (row.retainedBy.mainView || 0) > 0) { cur = ids[i]; break; }
+					}
+					if (cur === null && ids.length) cur = ids[ids.length - 1];
+				}
+				if (cur === null) { errs.push('未解析出当前会话 id'); }
+				else {
+					var scope = sessions.scope(cur);
+					if (scope === undefined) { errs.push('scope 解析失败'); }
+					else {
+						var conv = scope.get ? scope.get('conversation') : null;
+						if (conv && conv.input && typeof conv.input.for === 'function') {
+							conv.input.for(scope).setDraft(text);
+							LAST_ERR = '';
+							return true;
+						}
+						errs.push('conversation.input 不可用');
+					}
+				}
+			}
+		} catch (e) { errs.push('官方通道: ' + e); }
+
+		// DOM 兜底（React 受控组件兼容写法）
+		try {
+			var ta = document.querySelector('textarea');
+			var ce = document.querySelector('[contenteditable="true"]');
+			var target = ta || ce;
+			if (!target) { errs.push('未找到输入框'); }
+			else {
+				target.focus();
+				if (ta) {
+					var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+					setter.call(ta, text);
+					ta.dispatchEvent(new Event('input', { bubbles: true }));
+					ta.dispatchEvent(new Event('change', { bubbles: true }));
+				} else {
+					var sel = window.getSelection(), range = document.createRange();
+					range.selectNodeContents(ce);
+					sel.removeAllRanges(); sel.addRange(range);
+					var done = false;
+					try { done = document.execCommand('insertText', false, text); } catch (e) {}
+					if (!done) { ce.textContent = text; ce.dispatchEvent(new InputEvent('input', { bubbles: true })); }
+				}
+				LAST_ERR = '';
+				return true;
+			}
+		} catch (e) { errs.push('DOM 兜底: ' + e); }
+
+		LAST_ERR = errs.join(' | ');
+		console.warn('[' + SRC + '] 写入失败:', LAST_ERR);
+		return false;
+	}
+
+	// ── 跨源点击兜底：外层捕获点击 → 换算坐标 → CDP 取元素 ──
+	var CDP_MODE = false;
+
+	document.addEventListener('click', async function (e) {
+		if (!ACTIVE || !CDP_MODE || !CDP_SESSION) return;
+		var frame = findFrame();
+		if (!frame) return;
+		// 只处理点在 iframe 区域内的事件
+		var fr = frame.getBoundingClientRect();
+		if (e.clientX < fr.left || e.clientX > fr.right || e.clientY < fr.top || e.clientY > fr.bottom) return;
+		e.preventDefault();
+		e.stopPropagation();
+
+		var x = Math.round(e.clientX - fr.left);
+		var y = Math.round(e.clientY - fr.top);
+		setStatus('取元素中…');
+		var info = null;
+		try { info = await cdpPick(x, y); }
+		catch (err) { setStatus('✗ ' + (err.message || err), true); return; }
+		if (!info) { setStatus('✗ 该位置没有元素', true); return; }
+		var ok = writeDraft(CTX, buildDraft(info));
+		if (ok) {
+			setStatus('✓ 已写入输入框：' + String(info.selector).slice(0, 44));
+			ACTIVE = false; CDP_MODE = false;
+			HUD.classList.remove('on');
+		} else {
+			setStatus('✗ 写入失败：' + String(LAST_ERR || '未知').slice(0, 60), true);
+		}
+	}, true);
+
+	// ── 接 iframe 内选中的元素 ───────────────────────────────
+	window.addEventListener('message', function (ev) {
+		var d = ev.data || {};
+		if (d.source !== MSG || !d.info) return;
+		var ok = writeDraft(CTX, buildDraft(d.info));
+		if (ok) {
+			setStatus('✓ 已写入输入框：' + String(d.info.selector).slice(0, 44));
+			ACTIVE = false;
+			HUD.classList.remove('on');
+		} else {
+			setStatus('✗ 写入失败：' + String(LAST_ERR || '未知').slice(0, 60), true);
+		}
+	});
+
+	// ── 开关 ────────────────────────────────────────────────
+	function setActive(on) {
+		ACTIVE = !!on;
+		HUD.classList.toggle('on', ACTIVE);
+
+		if (!ACTIVE) { turnOffAll(); CDP_MODE = false; return; }
+
+		var frame = findFrame();
+		var rep0 = frameReport();
+		console.info('[dsh-quick-pick] 本次尝试:', JSON.stringify({ total: rep0.total, picked: frame ? { src: (frame.src||'').slice(0,60), marker: frame.dataset.sidebarBrowserFrame||'', title: frame.title||'' } : null }, null, 1));
+		if (!frame) {
+			console.warn('[dsh-quick-pick] 页面上一个 iframe 都没有, DOM 实况:', JSON.stringify(rep0, null, 1));
+			setStatus('页面上没有 iframe：请确认右侧边栏已打开页面', true);
+			ACTIVE = false; HUD.classList.remove('on');
+			return;
+		}
+		var src = frame.src || '';
+		try {
+			var loc = frame.contentWindow && frame.contentWindow.location;
+			if (loc && loc.href && loc.href !== 'about:blank') src = loc.href;
+		} catch (e) {}
+		if (!/^https?:\/\//i.test(src)) {
+			// 不直接放弃：有些宿主用 about:blank + 写入内容，仍可能有真实 DOM
+			var d0 = null;
+			try { d0 = frame.contentDocument; } catch (e) {}
+			var hasContent = d0 && d0.body && d0.body.children.length > 0 && d0.body.innerText.trim().length > 0;
+			if (!hasContent) {
+				setStatus('页面还没加载完：请在右侧边栏打开一个页面后再点', true);
+				ACTIVE = false; HUD.classList.remove('on');
+				return;
+			}
+		}
+
+		var res = injectFrame(frame, true);
+		if (!res.ok) {
+			// 跨源：回退到 host 端 CDP（用无头 Chrome 打开同一网址取元素）
+			setStatus('跨源页面，正在通过 CDP 取元素…');
+			cdpLaunch(src).then(function () {
+				CDP_MODE = true;
+				setStatus('CDP 就绪：点页面里的任意元素…');
+			}).catch(function (e) {
+				setStatus('✗ ' + res.why + '；CDP 也失败：' + (e.message || e), true);
+				ACTIVE = false; HUD.classList.remove('on');
+			});
+			return;
+		}
+		setStatus('点页面里的任意元素…');
+	}
+
+	// ── HUD ────────────────────────────────────────────────
+	function buildHud() {
+		if (HUD) return;
+		var d = document.createElement('div');
+		d.id = '__dqp_hud';
+		d.title = '开启后在右侧边栏的页面上点元素（Esc 退出，⌘/Ctrl+Shift+E 开关）';
+		d.innerHTML = '<span class="dot"></span><span class="dqp-label">选 区 批 注</span>';
+		d.addEventListener('click', function (e) {
+			e.stopPropagation();
+			e.preventDefault();
+			if (e.shiftKey || e.altKey) { diag(); return; }
+			setActive(!ACTIVE);
+		});
+		['mousedown', 'mouseup', 'dblclick', 'pointerdown', 'pointerup'].forEach(function (ev) {
+			d.addEventListener(ev, function (e) { e.stopPropagation(); });
+		});
+		document.body.appendChild(d);
+		HUD = d;
+	}
+
+	// ── 入口 ────────────────────────────────────────────────
+	function initPlugin() {
+		injectStyle();
+
+		document.addEventListener('keydown', function (e) {
+			if (e.key === 'Escape' && ACTIVE) {
+				e.stopPropagation();
+				setActive(false);
+				return;
+			}
+			if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'E' || e.key === 'e')) {
+				e.preventDefault();
+				e.stopPropagation();
+				setActive(!ACTIVE);
+			}
+		}, true);
+
+		return {
+			name: SRC,
+			inject: ['sessions'],
+			apply: function (ctx) {
+				CTX = ctx;
+				var boot = function () {
+					if (!document.body) { setTimeout(boot, 200); return; }
+					buildHud();
+					console.info('[' + SRC + '] ready — 先在右侧边栏打开页面，再点右下角开启选区');
+				};
+				boot();
+			}
+		};
+	}
+
+	// ── 加载 ────────────────────────────────────────────────
+	if (typeof window.__ModuleLoader__ !== 'undefined' &&
+		typeof window.__ModuleLoader__.load === 'function') {
+		window.__ModuleLoader__.load({ id: SRC, factory: initPlugin });
+	} else {
+		var plugin = initPlugin();
+		if (plugin && typeof plugin.apply === 'function') {
+			try {
+				plugin.apply({
+					get: function () { return undefined; },
+					effect: function (fn) { try { fn(); } catch (e) {} },
+					on: function () {},
+				});
+			} catch (e) { console.warn('[' + SRC + '] fallback apply failed:', e); }
+		}
+		console.info('[' + SRC + '] fallback mode');
+	}
+})();

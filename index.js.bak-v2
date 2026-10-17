@@ -1,0 +1,28 @@
+// dsh-quick-pick — 极简网页代码选区插件（host 端）
+// 
+// 本插件利用 DeepSeek Harness 桌面端的 Electron 环境，直接对内置浏览器（webview）
+// 进行元素代码选区与提取，无需启动外部无头浏览器或 CDP 服务。
+
+export const name = 'dsh-quick-pick';
+export const inject = ['webServer'];
+
+export function apply(ctx) {
+	const webServer = ctx.webServer;
+	try {
+		ctx.effect(() => webServer.register({
+			kind: 'exact',
+			path: '/quick-pick/ping',
+			handler: async (req, res) => {
+				res.writeHead(200, {
+					'content-type': 'application/json; charset=utf-8',
+					'cache-control': 'no-store'
+				});
+				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.0.0' }));
+			}
+		}), 'dsh-quick-pick: ping');
+	} catch (e) {
+		console.warn('[dsh-quick-pick] register ping route failed:', e);
+	}
+
+	ctx.on('dispose', () => {});
+}
