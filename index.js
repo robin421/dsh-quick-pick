@@ -46,15 +46,25 @@ const PROBE_SCRIPT = [
 
 function injectProbe(html) {
 	if (typeof html !== 'string' || html.indexOf('data-dsh-quick-pick') >= 0) return html;
-	const m = /<\/body\s*>/i.exec(html);
-	if (m) return html.slice(0, m.index) + PROBE_SCRIPT + html.slice(m.index);
-	const m2 = /<\/html\s*>/i.exec(html);
-	if (m2) return html.slice(0, m2.index) + PROBE_SCRIPT + html.slice(m2.index);
+	const body = /<\/body\s*>/i.exec(html);
+	if (body) return html.slice(0, body.index) + PROBE_SCRIPT + html.slice(body.index);
+	const head = /<\/head\s*>/i.exec(html);
+	if (head) return html.slice(0, head.index) + PROBE_SCRIPT + html.slice(head.index);
+	const htmlEnd = /<\/html\s*>/i.exec(html);
+	if (htmlEnd) return html.slice(0, htmlEnd.index) + PROBE_SCRIPT + html.slice(htmlEnd.index);
 	return html + PROBE_SCRIPT;
 }
 
-// 包装 better-sidebar 的 /sidebar/html 路由：只改 text/html 响应体。
-// better-sidebar 可能晚于本插件加载，所以调用方要轮询重试。
+export { installPreviewProbe, injectProbe };
+
+// 包装 better-sidebar 的 /sidebar/html 路由，把探针插进 HTML 响应。
+//
+// ⚠️ 必须保持**流式**语义：better-sidebar 用 `pipeline(readStream, res)` 输出，
+// 一旦我们把 res.end 拦下来（不真正结束），pipeline 永远等不到 finish，
+// 预览就会白屏/一直转圈（选区副本能显示，正常预览却不显示）。
+// 所以这里只做两件事：
+//   1) writeHead 时对 text/html 去掉 content-length（改成 chunked，长度会变）；
+//   2) 在第一个包含 </head> / </body> 的 chunk 里插入探针，其余照常透传。
 function installPreviewProbe(webServer) {
 	const table = webServer && webServer.prefixes;
 	if (!table || typeof table.get !== 'function') return false;
@@ -66,64 +76,88 @@ function installPreviewProbe(webServer) {
 	route.handler = async function (req, res) {
 		if (req.method !== 'GET') return original(req, res);
 
-		const chunks = [];
-		let head = null;
 		const origWriteHead = res.writeHead;
 		const origWrite = res.write;
 		const origEnd = res.end;
 
-		res.writeHead = function (status, headers) {
-			head = { status: status, headers: headers || {} };
-			return res;
-		};
-		res.write = function (chunk) {
-			if (chunk !== undefined && chunk !== null) {
-				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-			}
-			return true;
-		};
-		res.end = function (chunk) {
-			if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') {
-				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-			}
-			return res;
+		let injectable = false;   // 响应头声明了 text/html
+		let injected = false;     // 探针已经写出去
+		let pending = Buffer.alloc(0);
+		const MAX_BUFFER = 4 * 1024 * 1024;
+
+		const toBuf = (chunk, encoding) => {
+			if (Buffer.isBuffer(chunk)) return chunk;
+			return Buffer.from(String(chunk), typeof encoding === 'string' ? encoding : 'utf8');
 		};
 
-		let failure = null;
+		res.writeHead = function (status, headers) {
+			let h = headers;
+			if (Array.isArray(h)) h = Object.fromEntries(h);
+			if (h && typeof h === 'object') {
+				const ctype = String(h['content-type'] || h['Content-Type'] || '');
+				if (/text\/html/i.test(ctype)) {
+					injectable = true;
+					h = { ...h };
+					delete h['content-length'];
+					delete h['Content-Length'];
+				}
+				return origWriteHead.call(res, status, h);
+			}
+			return origWriteHead.apply(res, arguments);
+		};
+
+		// 找探针落点：优先 </body>，其次 </head>；返回 -1 表示这一块还不足以判断
+		const injectionPoint = (text) => {
+			const body = /<\/body\s*>/i.exec(text);
+			if (body) return body.index;
+			const head = /<\/head\s*>/i.exec(text);
+			if (head) return head.index;
+			return -1;
+		};
+
+		res.write = function (chunk, encoding, cb) {
+			if (!injectable || injected) return origWrite.call(res, chunk, encoding, cb);
+			if (chunk !== undefined && chunk !== null) {
+				pending = Buffer.concat([pending, toBuf(chunk, encoding)]);
+			}
+			const text = pending.toString('utf8');
+			const at = injectionPoint(text);
+			if (at >= 0) {
+				injected = true;
+				const out = Buffer.from(injectProbe(text), 'utf8');
+				pending = Buffer.alloc(0);
+				return origWrite.call(res, out, encoding, cb);
+			}
+			// 这一块里还没有落点：先扣着（正常 HTML 的 head 一定在前面）
+			if (pending.length > MAX_BUFFER) {
+				injected = true;
+				const out = pending;
+				pending = Buffer.alloc(0);
+				return origWrite.call(res, out, encoding, cb);
+			}
+			if (typeof cb === 'function') cb();
+			return true;
+		};
+
+		res.end = function (chunk, encoding, cb) {
+			if (!injectable || injected) return origEnd.call(res, chunk, encoding, cb);
+			if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') {
+				pending = Buffer.concat([pending, toBuf(chunk, encoding)]);
+			}
+			injected = true;
+			let body = pending;
+			pending = Buffer.alloc(0);
+			if (body.length > 0) body = Buffer.from(injectProbe(body.toString('utf8')), 'utf8');
+			return origEnd.call(res, body, encoding, cb);
+		};
+
 		try {
 			await original(req, res);
-		} catch (err) {
-			failure = err;
 		} finally {
 			res.writeHead = origWriteHead;
 			res.write = origWrite;
 			res.end = origEnd;
 		}
-		if (failure) {
-			try { res.destroy(); } catch (e) {}
-			return;
-		}
-		let body = Buffer.concat(chunks);
-		if (head === null) {
-			res.end(body);
-			return;
-		}
-		let headers = head.headers;
-		if (Array.isArray(headers)) {
-			headers = Object.fromEntries(headers);
-		}
-		headers = { ...headers };
-		const ctype = String(headers['content-type'] || headers['Content-Type'] || '');
-		if (/text\/html/i.test(ctype) && body.length > 0) {
-			const text = body.toString('utf8');
-			if (text.indexOf('data-dsh-quick-pick') < 0) {
-				body = Buffer.from(injectProbe(text), 'utf8');
-			}
-		}
-		delete headers['content-length'];
-		delete headers['Content-Length'];
-		res.writeHead(head.status, headers);
-		res.end(body);
 	};
 	return true;
 }
@@ -168,7 +202,7 @@ export function apply(ctx) {
 					'content-type': 'application/json; charset=utf-8',
 					'cache-control': 'no-store'
 				});
-				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.0' }));
+				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.1' }));
 			}
 		}), 'dsh-quick-pick: ping');
 
