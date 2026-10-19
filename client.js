@@ -252,7 +252,20 @@
 			return true;
 		}
 
-		// 1) 有 web-review 的选区开关就用它（它自带页面桥，能给出元素快照）
+		// 1) 优先在本插件自己的通道里选区：同源帧原地挂监听、沙箱帧叠副本，
+		//    两条路都不碰原预览（不刷新）。web-review 的开关放到后面兜底，
+		//    因为它可能让预览重新加载一次。
+		if (pickInPageFrame()) {
+			// 同源原地挂监听时 pickInPageFrame 不弹提示，这里补一条；
+			// 沙箱副本分支自己已提示过（或正在取页），避免叠加
+			if (!PREVIEW_PICKING && !OVERLAY && !OVERLAY_PENDING) {
+				showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath（Esc 取消）', false);
+			}
+			report('preview-pick', { ok: true, how: 'page-frame' });
+			return true;
+		}
+
+		// 2) 兜底：有 web-review 的选区开关就用它（它自带页面桥，能给出元素快照）
 		var btn = findPreviewPickButton();
 		if (btn) {
 			if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
@@ -264,13 +277,6 @@
 			setEntryPicking(true);
 			showToast('选区已开启：在当前网页上点元素，Full XPath 会写进输入框', false);
 			report('preview-pick', { ok: true, how: 'web-review' });
-			return true;
-		}
-
-		// 2) 没有它：直接在当前网页预览帧里选区（同源可读时）
-		if (pickInPageFrame()) {
-			showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath（Esc 取消）', false);
-			report('preview-pick', { ok: true, how: 'page-frame' });
 			return true;
 		}
 
@@ -776,17 +782,26 @@
 
 	// ── 直接在当前网页预览帧里选区 ─────────────────────────────────────
 	// 依次尝试三条通道，全部不新开任何窗口：
-	//   1) 同源可读的 iframe → 宿主直接挂监听
+	//   1) 同源可读的 iframe → 宿主直接挂监听（不动页面）
 	//   2) Electron <webview> → executeJavaScript 注入探针
-	//   3) 沙箱 iframe → srcdoc 副本 + 内联探针
+	//   3) 沙箱 iframe → 覆盖层副本 + 内联探针（原帧不改写）
 	function pickInPageFrame() {
-		var list = document.querySelectorAll('iframe');
+		// 优先真正的网页预览帧（HTML 预览 / 内置浏览器），避免先命中别的插件帧
+		var list = Array.prototype.slice.call(document.querySelectorAll('iframe'));
+		var rank = function (f) {
+			if (f.hasAttribute && f.hasAttribute('data-html-preview')) return 0;
+			try { if (f.closest && f.closest('[data-webview-ui]')) return 1; } catch (e) {}
+			return 2;
+		};
+		list.sort(function (a, b) { return rank(a) - rank(b); });
+
 		var sandboxCandidates = [];
 		for (var i = 0; i < list.length; i++) {
 			var f = list[i];
 			if (!f.offsetWidth || !f.offsetHeight) continue;
 			if (f.offsetWidth < 120 || f.offsetHeight < 120) continue;
 			if (PANEL && PANEL.contains(f)) continue;
+			if (OVERLAY && OVERLAY.contains(f)) continue;
 
 			var doc = null;
 			try { doc = f.contentDocument; } catch (e) { doc = null; }
