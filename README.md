@@ -48,13 +48,14 @@ DSH 右侧的预览帧是**独立沙箱文档**（`dsh-app://` 协议或独立 o
 ## 已知限制
 
 - 读不到 DOM 的沙箱/跨源预览会改用**覆盖层副本**选区：原预览帧全程不动（不重载、不跳回页面顶部），但副本从页面顶部开始滚动，且副本不执行页面脚本（靠 JS 动态渲染的内容可能缺失）
+- `blob:` 预览（Web 端 HTML 文件预览）由宿主直接 fetch 原文，同样走覆盖层，不刷新原帧
 - 选区只作用于预览帧，不读写磁盘上的源文件
 
 ## 调试
 
 日志：`~/.dsh/logs/quick-pick.log`
 
-会记录 `ready` / `address-inputs` / `preview-pick` / `page-frame-pick` / `sandbox-inject` / `picked` 等事件；host 端另有 `GET/POST /quick-pick/log` 接收上报。
+会记录 `ready` / `address-inputs` / `preview-pick` / `page-frame-pick` / `overlay-open` / `picked` 等事件；host 端另有 `GET/POST /quick-pick/log` 接收上报。
 
 ## License
 
