@@ -63,6 +63,10 @@
 	var OVERLAY_TARGET = null;     // 被覆盖的原预览帧
 	var OVERLAY_TICK = 0;          // 跟随原帧位置的定时器
 	var OVERLAY_PENDING = false;   // 正在取页（Esc 退出时作废）
+	// 页面内常驻探针（host 端注入到 /sidebar/html 预览文档里）。
+	// 探针在预览文档加载时就在，点选区只需 postMessage 激活 → 原页面
+	// 完全不刷新、不产生副本、滚动位置保持不变。
+	var PROBE_WAIT = null;         // { frame, timer }：已发 probe-ping，等回音
 	var LAST_PREVIEW_BAR_REPORT = 0;
 	var LAST_INPUT_COUNT = -1;
 	// 同一窗口多次热重载保持同一标识，便于从日志区分不同客户端
@@ -592,6 +596,11 @@
 		var wasPreview = PREVIEW_PICKING;
 		stopPick(true);                 // 清宿主侧的浮层/同源帧选区
 		setEntryPicking(false);
+		// 还在等探针回音：撤掉等待，别再弹覆盖层
+		if (PROBE_WAIT) {
+			if (PROBE_WAIT.timer) clearTimeout(PROBE_WAIT.timer);
+			PROBE_WAIT = null;
+		}
 		removeProbeOverlay();           // 撤掉选区副本（原预览帧本来就没动过）
 
 		if (FRAME_DOC) {
@@ -677,6 +686,49 @@
 		fetchPageHtml(src, cb);
 	}
 
+	// ── 页面内常驻探针通道（首选）────────────────────────────────────
+	// host 端把探针脚本注入 /sidebar/html 的 HTML 响应，所以预览文档里
+	// 本来就有一个静默探针：点选区只是 postMessage 叫醒它，原页面不动。
+	// 听不到回音（老预览、非 /sidebar/html 预览）才退回选区副本覆盖层。
+	function frameWindow(frame) {
+		try { return frame && frame.contentWindow || null; } catch (e) { return null; }
+	}
+
+	function tryProbeChannel(frame) {
+		var win = frameWindow(frame);
+		if (!win) return false;
+		try { win.postMessage({ source: SRC, type: 'probe-ping' }, '*'); } catch (e) { return false; }
+		if (PROBE_WAIT && PROBE_WAIT.timer) clearTimeout(PROBE_WAIT.timer);
+		setEntryPicking(true);
+		PROBE_WAIT = {
+			frame: frame,
+			timer: setTimeout(function () {
+				var w = PROBE_WAIT;
+				PROBE_WAIT = null;
+				if (!w || w.frame !== frame) return;
+				if (!PREVIEW_PICKING) return;   // 等回音期间用户已经退出
+				// 没探针（老预览文档）：退回覆盖层副本（原帧仍不改写）
+				report('probe-miss', { src: String(frame.getAttribute('src') || '').slice(0, 80) });
+				injectSandboxFrame(frame);
+			}, 450)
+		};
+		return true;
+	}
+
+	// 探针回音：确认是哪个帧，并让探针进入选区态
+	function probeAnswered(frame) {
+		if (!PROBE_WAIT || PROBE_WAIT.frame !== frame) return false;
+		if (PROBE_WAIT.timer) clearTimeout(PROBE_WAIT.timer);
+		PROBE_WAIT = null;
+		var win = frameWindow(frame);
+		if (win) {
+			try { win.postMessage({ source: SRC, type: 'activate' }, '*'); } catch (e) {}
+		}
+		setEntryPicking(true);
+		report('probe-pick', { src: String(frame.getAttribute('src') || '').slice(0, 80) });
+		return true;
+	}
+
 	// ── 选区副本覆盖层 ─────────────────────────────────────────────────
 	// 原预览帧（blob / 沙箱 / 跨源）宿主读不到 DOM，但可以在它上面叠一层
 	// 「同内容副本」来选区。关键：**原帧一律不动**（不 setAttribute、不写
@@ -722,7 +774,9 @@
 
 		var box = document.createElement('div');
 		box.id = OVERLAY_ID;
-		box.style.cssText = 'position:fixed;z-index:2147483000;overflow:hidden;display:none;' +
+		// 先保持透明：副本渲染完成再显示，避免"白闪一下"像刷新
+		box.style.cssText = 'position:fixed;z-index:2147483000;overflow:hidden;display:none;opacity:0;' +
+			'transition:opacity .12s linear;' +
 			'border:1px solid #3b82f6;border-radius:4px;background:#fff;' +
 			'box-shadow:0 0 0 2px rgba(59,130,246,.28), 0 16px 48px rgba(0,0,0,.4);';
 
@@ -741,6 +795,14 @@
 		syncOverlayRect();
 		// 预览区会随窗口/侧栏变化，低频跟随即可（不用常驻 rAF 空转）
 		OVERLAY_TICK = setInterval(syncOverlayRect, 150);
+
+		// 副本 ready 之后再亮出来；这里也留一条日志，便于确认"点选区后是否真的
+		// 只是副本在加载"。
+		f.addEventListener('load', function () {
+			if (!OVERLAY || OVERLAY !== box) return;
+			report('overlay-ready', { src: String(html ? html.length : 0) });
+			requestAnimationFrame(function () { box.style.opacity = '1'; });
+		});
 		return f;
 	}
 
@@ -749,6 +811,20 @@
 		if (!frame || !document.body.contains(frame)) return false;
 		var src = frame.getAttribute('src') || '';
 		if (!src) return false;
+
+		// 原帧快照：用于确认点选区期间原预览有没有被别的东西重载/改写
+		var snap = function () {
+			try {
+				return {
+					src: String(frame.getAttribute('src') || '').slice(0, 80),
+					srcdoc: !!frame.getAttribute('srcdoc'),
+					sandbox: frame.getAttribute('sandbox'),
+					sameDoc: !!frame.contentDocument
+				};
+			} catch (e) { return null; }
+		};
+		report('overlay-target-before', snap());
+		setTimeout(function () { report('overlay-target-after', snap()); }, 800);
 
 		// 覆盖层已开着同一帧 → 只把探针叫醒，不重新取页
 		if (OVERLAY && OVERLAY_TARGET === frame && OVERLAY_FRAME) {
@@ -852,7 +928,13 @@
 
 		for (var m = 0; m < sandboxCandidates.length; m++) {
 			var cand = sandboxCandidates[m];
-			// 沙箱帧读不到 DOM：在原帧上叠一层选区副本，原帧保持不动、不重载
+			// 首选：预览文档里已经有 host 注入的常驻探针 → 只叫醒它，
+			// 原页面一格都不动（不刷新、不回顶部、不产生副本）。
+			if (tryProbeChannel(cand)) {
+				report('page-frame-pick', { ok: true, how: 'probe-wait', src: String(cand.getAttribute('src') || '').slice(0, 100) });
+				return true;
+			}
+			// 听不到探针（老预览文档）：在原帧上叠一层选区副本，原帧保持不动
 			if (injectSandboxFrame(cand)) {
 				report('page-frame-pick', { ok: true, how: 'sandbox-overlay', src: String(cand.getAttribute('src') || '').slice(0, 100) });
 				return true;
@@ -1304,7 +1386,23 @@
 			return;
 		}
 
-		// 3) 浮层探针 / 选区副本探针
+		// 3) 页面内常驻探针（host 注入到预览文档）：先回 ping，再报告激活
+		if (d.source === SRC && d.type === 'probe-pong') {
+			var pf = PROBE_WAIT && PROBE_WAIT.frame;
+			if (pf && frameWindow(pf) === ev.source) probeAnswered(pf);
+			return;
+		}
+		if (d.source === SRC && d.type === 'probe-active') {
+			// 探针已进入选区态：兜底刷新一下按钮态即可
+			if (!PREVIEW_PICKING) { setEntryPicking(true); }
+			return;
+		}
+		if (d.source === SRC && d.type === 'probe-gone') {
+			PROBE_WAIT = null;
+			return;
+		}
+
+		// 4) 浮层探针 / 选区副本探针 / 注入探针
 		if (d.source === SRC && d.type === 'cancel') {
 			setEntryPicking(false);
 			removeProbeOverlay();
@@ -1319,6 +1417,21 @@
 	});
 
 	// ── 初始化 ─────────────────────────────────────────────────────────
+	// 诊断：任何预览帧（非选区副本）重新 load，都记一笔。
+	// 用户反馈"点选区还是会刷新"，靠这条日志就能区分是原帧真被重载，
+	// 还是只是选区副本在加载。
+	function watchPreviewFrameLoads() {
+		document.addEventListener('load', function (e) {
+			var t = e && e.target;
+			if (!t || t.tagName !== 'IFRAME') return;
+			if (t.id === OVERLAY_FRAME_ID) return;
+			if (!t.offsetWidth && !t.offsetHeight) return;
+			var src = '';
+			try { src = String(t.getAttribute('src') || '').slice(0, 90); } catch (err) {}
+			report('preview-frame-load', { src: src, overlay: !!OVERLAY, picking: !!(PICKING || PREVIEW_PICKING) });
+		}, true);
+	}
+
 	function initPlugin() {
 		document.addEventListener('keydown', function (e) {
 			if (e.key === 'Escape' && (PICKING || PREVIEW_PICKING)) {
@@ -1353,6 +1466,7 @@
 				CTX = ctx;
 				var boot = function () {
 					if (!document.body) { setTimeout(boot, 200); return; }
+					watchPreviewFrameLoads();
 					injectToolbarButtons();
 					observer.observe(document.body, { childList: true, subtree: true });
 					report('ready', envInfo({ inputs: findAddressInputs().length }));

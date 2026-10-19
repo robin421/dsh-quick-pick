@@ -6,8 +6,139 @@
 export const name = 'dsh-quick-pick';
 export const inject = ['webServer'];
 
+// ── 预览文档常驻探针 ─────────────────────────────────────────────────────
+// 把选区探针注入 /sidebar/html 的 HTML 响应里。这样预览文档加载时探针就
+// 已经在页面里了：之后点「选区 (XPath)」只是 postMessage 叫醒它，
+// 原预览帧不重载、不刷新、不跳回顶部，也不需要选区副本覆盖层。
+//
+// 探针完全静默（只监听 message），不激活时不影响页面任何行为。
+const PROBE_SCRIPT = [
+	'<script data-dsh-quick-pick>(function(){',
+	'if(window.__dqpInjected)return;window.__dqpInjected=1;',
+	'var A=false,H=null,HL=null,TIP=null,ST=null;',
+	"function send(m){try{window.parent.postMessage(m,'*')}catch(e){}}",
+	"function xp(el){if(!el||el.nodeType!==1)return'';var t=el.tagName.toLowerCase();if(t==='html')return'/html';if(t==='body')return'/html/body';",
+	"var s=[],c=el;while(c&&c.nodeType===1){var n=c.tagName.toLowerCase();if(n==='html')break;if(n==='body'){s.unshift('body');break}",
+	"var i=1,p=c.parentElement;if(p){var k=p.children;for(var j=0;j<k.length;j++){if(k[j]===c)break;if(k[j].tagName&&k[j].tagName.toLowerCase()===n)i++}}",
+	"s.unshift(n+'['+i+']');c=p}return'/html/'+s.join('/')}",
+	"function hl(){if(HL)return HL;HL=document.createElement('div');HL.id='__dqp_hl';",
+	"HL.style.cssText='position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #3b82f6;background:rgba(59,130,246,.18);border-radius:3px;box-sizing:border-box;display:none;';",
+	"(document.body||document.documentElement).appendChild(HL);return HL}",
+	"function tip(){if(TIP)return TIP;TIP=document.createElement('div');TIP.id='__dqp_tip';",
+	"TIP.style.cssText='position:fixed;left:0;right:0;top:0;z-index:2147483646;pointer-events:none;font:500 12px/22px -apple-system,system-ui,sans-serif;text-align:center;background:rgba(15,23,42,.86);color:#e2e8f0;';",
+	"TIP.textContent='选区模式 · 点元素取 XPath · Esc 退出';(document.body||document.documentElement).appendChild(TIP);return TIP}",
+	"function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;H=el;var b=hl(),r=el.getBoundingClientRect();",
+	"b.style.display=(r.width||r.height)?'block':'none';b.style.left=r.left+'px';b.style.top=r.top+'px';b.style.width=r.width+'px';b.style.height=r.height+'px'}",
+	"function onClick(e){if(!A)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();var el=H||e.target;var x=xp(el);off();",
+	"send({source:'dsh-quick-pick',type:'picked',payload:{xpath:x,tag:el&&el.tagName?el.tagName.toLowerCase():''}})}",
+	"function onKey(e){if(e.key==='Escape'&&A){e.preventDefault();e.stopPropagation();off();send({source:'dsh-quick-pick',type:'cancel'})}}",
+	"function on(){if(A)return;A=true;if(!ST){ST=document.createElement('style');ST.id='__dqp_cur';ST.textContent='*,* *{cursor:crosshair !important;}';document.head&&document.head.appendChild(ST)}",
+	"tip().style.display='block';document.addEventListener('mouseover',onOver,true);document.addEventListener('click',onClick,true);document.addEventListener('keydown',onKey,true)}",
+	"function off(){A=false;H=null;document.removeEventListener('mouseover',onOver,true);document.removeEventListener('click',onClick,true);document.removeEventListener('keydown',onKey,true);",
+	"if(HL)HL.style.display='none';if(ST){ST.remove();ST=null}if(TIP){TIP.remove();TIP=null}}",
+	"window.addEventListener('message',function(ev){var d=ev.data;if(!d||d.source!=='dsh-quick-pick')return;",
+	"if(d.type==='probe-ping'){send({source:'dsh-quick-pick',type:'probe-pong'})}",
+	"else if(d.type==='activate'){on();send({source:'dsh-quick-pick',type:'probe-active'})}",
+	"else if(d.type==='cancel'||d.type==='exit'||d.type==='deactivate'){off()}});",
+	"window.addEventListener('pagehide',function(){send({source:'dsh-quick-pick',type:'probe-gone'})});",
+	'})();<', '/script>'
+].join('');
+
+function injectProbe(html) {
+	if (typeof html !== 'string' || html.indexOf('data-dsh-quick-pick') >= 0) return html;
+	const m = /<\/body\s*>/i.exec(html);
+	if (m) return html.slice(0, m.index) + PROBE_SCRIPT + html.slice(m.index);
+	const m2 = /<\/html\s*>/i.exec(html);
+	if (m2) return html.slice(0, m2.index) + PROBE_SCRIPT + html.slice(m2.index);
+	return html + PROBE_SCRIPT;
+}
+
+// 包装 better-sidebar 的 /sidebar/html 路由：只改 text/html 响应体。
+// better-sidebar 可能晚于本插件加载，所以调用方要轮询重试。
+function installPreviewProbe(webServer) {
+	const table = webServer && webServer.prefixes;
+	if (!table || typeof table.get !== 'function') return false;
+	const route = table.get('/sidebar/html');
+	if (!route || route.__dqpProbeWrapped || typeof route.handler !== 'function') return false;
+	route.__dqpProbeWrapped = true;
+	const original = route.handler;
+
+	route.handler = async function (req, res) {
+		if (req.method !== 'GET') return original(req, res);
+
+		const chunks = [];
+		let head = null;
+		const origWriteHead = res.writeHead;
+		const origWrite = res.write;
+		const origEnd = res.end;
+
+		res.writeHead = function (status, headers) {
+			head = { status: status, headers: headers || {} };
+			return res;
+		};
+		res.write = function (chunk) {
+			if (chunk !== undefined && chunk !== null) {
+				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			}
+			return true;
+		};
+		res.end = function (chunk) {
+			if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') {
+				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			}
+			return res;
+		};
+
+		let failure = null;
+		try {
+			await original(req, res);
+		} catch (err) {
+			failure = err;
+		} finally {
+			res.writeHead = origWriteHead;
+			res.write = origWrite;
+			res.end = origEnd;
+		}
+		if (failure) {
+			try { res.destroy(); } catch (e) {}
+			return;
+		}
+		let body = Buffer.concat(chunks);
+		if (head === null) {
+			res.end(body);
+			return;
+		}
+		let headers = head.headers;
+		if (Array.isArray(headers)) {
+			headers = Object.fromEntries(headers);
+		}
+		headers = { ...headers };
+		const ctype = String(headers['content-type'] || headers['Content-Type'] || '');
+		if (/text\/html/i.test(ctype) && body.length > 0) {
+			const text = body.toString('utf8');
+			if (text.indexOf('data-dsh-quick-pick') < 0) {
+				body = Buffer.from(injectProbe(text), 'utf8');
+			}
+		}
+		delete headers['content-length'];
+		delete headers['Content-Length'];
+		res.writeHead(head.status, headers);
+		res.end(body);
+	};
+	return true;
+}
+
 export function apply(ctx) {
 	const webServer = ctx.webServer;
+
+	// 预览探针路由：better-sidebar 后加载 → 轮询装钩子（幂等）
+	const hookProbe = () => {
+		try { installPreviewProbe(webServer); } catch (e) {}
+	};
+	hookProbe();
+	const probeTimer = setInterval(hookProbe, 1000);
+	if (probeTimer.unref) probeTimer.unref();
+	ctx.on('dispose', () => clearInterval(probeTimer));
 
 	const MIME_MAP = {
 		'.html': 'text/html; charset=utf-8',
@@ -37,7 +168,7 @@ export function apply(ctx) {
 					'content-type': 'application/json; charset=utf-8',
 					'cache-control': 'no-store'
 				});
-				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.1.0' }));
+				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.0' }));
 			}
 		}), 'dsh-quick-pick: ping');
 
