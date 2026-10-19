@@ -15,6 +15,12 @@
 //     4) iframe 用 sandbox="allow-same-origin"：宿主能读 DOM，但页面脚本不执行，
 //        避免 demo 页脚本碰触宿主 GUI。
 //
+//   2026-10-19 更新（用户反馈「点选区不要刷新页面」）：
+//     沙箱/跨源预览帧不再改写原帧（旧做法 setAttribute + frame.srcdoc 会导致
+//     预览重载、页面跳回顶部）。改为在原帧位置叠加一层「选区副本」覆盖层：
+//     原预览帧自始至终不动，关闭选区后覆盖层直接移除，零刷新、零闪动。
+//     同源可读的帧仍直接挂监听，同样不碰页面。
+//
 //   入口：网页预览地址栏旁的「✦ 选区 (XPath)」按钮（唯一注入点），
 //         快捷键 Cmd/Ctrl+Shift+E 也可直接开关浮层。
 //
@@ -48,7 +54,15 @@
 	var HOVERED = null;
 	var AUTOPICK = false;
 	var PREVIEW_PICKING = false;
-	var INJECTED_PAGE_SRCS = {};   // 已切过选区副本的预览页，避免反复重挂导致页面闪动
+
+	// 选区副本覆盖层：盖在原预览帧上，原帧始终不改写 → 点选区不会刷新页面
+	var OVERLAY_ID = '__dqp_overlay';
+	var OVERLAY_FRAME_ID = '__dqp_overlay_frame';
+	var OVERLAY = null;            // 覆盖层容器
+	var OVERLAY_FRAME = null;      // 覆盖层里的副本 iframe
+	var OVERLAY_TARGET = null;     // 被覆盖的原预览帧
+	var OVERLAY_TICK = 0;          // 跟随原帧位置的定时器
+	var OVERLAY_PENDING = false;   // 正在取页（Esc 退出时作废）
 	var LAST_PREVIEW_BAR_REPORT = 0;
 	var LAST_INPUT_COUNT = -1;
 	// 同一窗口多次热重载保持同一标识，便于从日志区分不同客户端
@@ -554,9 +568,13 @@
 		'var x=xp(hov);try{window.parent.postMessage({source:"dsh-quick-pick",type:"picked",payload:{xpath:x}},"*");}catch(err){}off();}' +
 		'function onKey(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();off();try{window.parent.postMessage({source:"dsh-quick-pick",type:"cancel"},"*");}catch(err){}}}' +
 		'function off(){on_=false;hov=null;document.removeEventListener("mouseover",onOver,true);document.removeEventListener("click",onClick,true);document.removeEventListener("keydown",onKey,true);' +
-		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();}' +
+		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();' +
+		'var tp=document.getElementById("__dqp_probe_tip");if(tp)tp.remove();}' +
 		'function on(){if(on_)return;on_=true;var s=document.getElementById("__dqp_probe_cursor");' +
 		'if(!s){s=document.createElement("style");s.id="__dqp_probe_cursor";s.textContent="*,* *{cursor:crosshair !important;}";(document.head||document.documentElement).appendChild(s);}' +
+		'var tip=document.getElementById("__dqp_probe_tip");if(!tip){tip=document.createElement("div");tip.id="__dqp_probe_tip";' +
+		'tip.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483646;pointer-events:none;font:500 12px/22px -apple-system,system-ui,sans-serif;text-align:center;background:rgba(15,23,42,.86);color:#e2e8f0;";' +
+		'tip.textContent="选区副本 · 原页面未刷新 · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
 		'document.addEventListener("mouseover",onOver,true);document.addEventListener("click",onClick,true);document.addEventListener("keydown",onKey,true);}' +
 		'window.addEventListener("message",function(ev){var d=ev.data;if(!d||d.source!=="dsh-quick-pick")return;' +
 		'if(d.type==="cancel"||d.type==="exit")off();else if(d.type==="activate")on();});' +
@@ -568,6 +586,7 @@
 		var wasPreview = PREVIEW_PICKING;
 		stopPick(true);                 // 清宿主侧的浮层/同源帧选区
 		setEntryPicking(false);
+		removeProbeOverlay();           // 撤掉选区副本（原预览帧本来就没动过）
 
 		if (FRAME_DOC) {
 			try {
@@ -599,15 +618,13 @@
 		showToast('已退出选区模式', false);
 	}
 
-	// 沙箱/跨源帧：取原文 → 注入探针 → srcdoc 重挂（副本与宿主同源，脚本可运行）
+	// 沙箱/跨源帧：取回原文，供「选区副本覆盖层」使用（原帧不改写）
 	//
 	// 取原文必须走 host 端代理：预览帧的 src 是 dsh-app:// 协议（或跨源），
 	// 在页面里 fetch(src) 拿不到内容；host 端的 /quick-pick/read-html 能直接
 	// 读磁盘（/sidebar/html/... 预览路由）或回源取页。
 	//
-	// 另外 DSH 的预览会把它重置回原 src，所以要记住"这个页面已切过副本"，
-	// 否则每次点选区都会重挂一次、页面来回闪（用户报的"一跳一跳"）。
-	// 取回预览页原文：桌面端窗口本身是 dsh-app:// 协议，相对路径到不了 host，
+	// 桌面端窗口本身是 dsh-app:// 协议，相对路径到不了 host，
 	// 所以逐通道尝试（相对 → 当前 origin → 本机端口）。
 	function fetchPageHtml(src, cb) {
 		var qs = '/quick-pick/read-html?src=' + encodeURIComponent(src);
@@ -638,34 +655,106 @@
 		tryNext();
 	}
 
+	// ── 选区副本覆盖层 ─────────────────────────────────────────────────
+	// 原预览帧（blob / 沙箱 / 跨源）宿主读不到 DOM，但可以在它上面叠一层
+	// 「同内容副本」来选区。关键：**原帧一律不动**（不 setAttribute、不写
+	// srcdoc），所以点选区不会触发预览重载，也不会跳回页面顶部。
+	function syncOverlayRect() {
+		if (!OVERLAY || !OVERLAY_TARGET) return;
+		// 预览被替换/关闭：副本跟着消失，避免盖在空处
+		if (!OVERLAY_TARGET.isConnected) {
+			removeProbeOverlay();
+			setEntryPicking(false);
+			return;
+		}
+		var r = null;
+		try { r = OVERLAY_TARGET.getBoundingClientRect(); } catch (e) { r = null; }
+		if (!r || !r.width || !r.height) {
+			OVERLAY.style.display = 'none';
+			return;
+		}
+		OVERLAY.style.display = 'block';
+		OVERLAY.style.left = r.left + 'px';
+		OVERLAY.style.top = r.top + 'px';
+		OVERLAY.style.width = r.width + 'px';
+		OVERLAY.style.height = r.height + 'px';
+	}
+
+	function removeProbeOverlay() {
+		OVERLAY_PENDING = false;
+		if (OVERLAY_TICK) {
+			clearInterval(OVERLAY_TICK);
+			OVERLAY_TICK = 0;
+		}
+		if (OVERLAY && OVERLAY.parentNode) {
+			try { OVERLAY.parentNode.removeChild(OVERLAY); } catch (e) {}
+		}
+		OVERLAY = null;
+		OVERLAY_FRAME = null;
+		OVERLAY_TARGET = null;
+	}
+
+	function showProbeOverlay(target, html) {
+		removeProbeOverlay();
+		OVERLAY_TARGET = target;
+
+		var box = document.createElement('div');
+		box.id = OVERLAY_ID;
+		box.style.cssText = 'position:fixed;z-index:2147483000;overflow:hidden;display:none;' +
+			'border:1px solid #3b82f6;border-radius:4px;background:#fff;' +
+			'box-shadow:0 0 0 2px rgba(59,130,246,.28), 0 16px 48px rgba(0,0,0,.4);';
+
+		var f = document.createElement('iframe');
+		f.id = OVERLAY_FRAME_ID;
+		f.setAttribute('sandbox', 'allow-scripts');   // 副本里只跑探针，不碰宿主 GUI
+		f.setAttribute('title', '选区副本');
+		f.style.cssText = 'display:block;width:100%;height:100%;border:0;background:#fff;';
+		f.srcdoc = html;
+
+		box.appendChild(f);
+		document.body.appendChild(box);
+
+		OVERLAY = box;
+		OVERLAY_FRAME = f;
+		syncOverlayRect();
+		// 预览区会随窗口/侧栏变化，低频跟随即可（不用常驻 rAF 空转）
+		OVERLAY_TICK = setInterval(syncOverlayRect, 150);
+		return f;
+	}
+
+	// 沙箱/跨源帧：取原文 → 复制到覆盖层 → 在副本里选区（原帧保持原样）
 	function injectSandboxFrame(frame) {
+		if (!frame || !document.body.contains(frame)) return false;
 		var src = frame.getAttribute('src') || '';
 		if (!src) return false;
 
-		// 已经是选区副本（srcdoc 还在）→ 直接重新激活探针，不重载页面
-		var isCopy = false;
-		try { isCopy = !!frame.getAttribute('srcdoc'); } catch (e) {}
-		if (isCopy) {
-			try { frame.contentWindow.postMessage({ source: SRC, type: 'activate' }, '*'); } catch (e) {}
+		// 覆盖层已开着同一帧 → 只把探针叫醒，不重新取页
+		if (OVERLAY && OVERLAY_TARGET === frame && OVERLAY_FRAME) {
+			try { OVERLAY_FRAME.contentWindow.postMessage({ source: SRC, type: 'activate' }, '*'); } catch (e) {}
 			setEntryPicking(true);
-			report('sandbox-activate', { src: src.slice(0, 80) });
+			report('overlay-activate', { src: src.slice(0, 80) });
 			return true;
 		}
+		removeProbeOverlay();
 
-		// 短时防抖：连点不要重复取页
-		var now = Date.now();
-		if (INJECTED_PAGE_SRCS[src] && now - INJECTED_PAGE_SRCS[src] < 3000) {
-			report('sandbox-inject-debounce', { src: src.slice(0, 80) });
+		// 取页期间再点一次：直接忽略（不重复请求，也不叠加副本）
+		if (OVERLAY_PENDING) {
+			report('overlay-debounce', { src: src.slice(0, 80) });
 			return true;
 		}
-		INJECTED_PAGE_SRCS[src] = now;
+		OVERLAY_PENDING = true;
 
 		fetchPageHtml(src, function (err, html) {
+			if (!OVERLAY_PENDING) return;   // 取页期间用户已按 Esc 退出
+			OVERLAY_PENDING = false;
 			if (err) {
 				var msg = String((err && err.message) || err);
-				delete INJECTED_PAGE_SRCS[src];
-				report('sandbox-inject', { ok: false, error: msg });
-				reportToDraft('预览页取回失败', { src: src.slice(0, 140), error: msg });
+				report('overlay-open', { ok: false, error: msg });
+				showToast('取不回预览页原文（blob/跨源预览暂不支持）', true);
+				return;
+			}
+			if (!document.body.contains(frame)) {
+				report('overlay-open', { ok: false, error: 'frame detached' });
 				return;
 			}
 			try {
@@ -674,14 +763,12 @@
 				var out = /<head\b[^>]*>/i.test(html)
 					? html.replace(/<head\b[^>]*>/i, function (m) { return m + inject; })
 					: inject + html;
-				frame.dataset.dqpInjected = '1';
-				frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-				frame.srcdoc = out;
+				showProbeOverlay(frame, out);
 				setEntryPicking(true);
-				showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath', false);
-				report('sandbox-inject', { ok: true, src: src.slice(0, 90) });
+				showToast('选区已开启：在预览副本上点元素，原页面不会刷新（Esc 退出）', false);
+				report('overlay-open', { ok: true, src: src.slice(0, 90) });
 			} catch (e) {
-				report('sandbox-inject', { ok: false, error: 'inject: ' + e });
+				report('overlay-open', { ok: false, error: 'overlay: ' + e });
 			}
 		});
 		return true;
@@ -729,10 +816,9 @@
 
 		for (var m = 0; m < sandboxCandidates.length; m++) {
 			var cand = sandboxCandidates[m];
-			// 沙箱开着时只能靠副本选区：页面会重载一次。关掉沙箱就没有这一步。
-			showToast('沙箱预览需切换为选区副本（会闪一下）；关掉沙箱（Temporarily disable）可避免闪动', false);
+			// 沙箱帧读不到 DOM：在原帧上叠一层选区副本，原帧保持不动、不重载
 			if (injectSandboxFrame(cand)) {
-				report('page-frame-pick', { ok: true, how: 'sandbox-inject', src: String(cand.getAttribute('src') || '').slice(0, 100) });
+				report('page-frame-pick', { ok: true, how: 'sandbox-overlay', src: String(cand.getAttribute('src') || '').slice(0, 100) });
 				return true;
 			}
 		}
@@ -927,6 +1013,7 @@
 	function closePanel() {
 		stopPick(true);
 		detachFrame();
+		removeProbeOverlay();
 		if (FRAME) {
 			try { FRAME.removeEventListener('load', onFrameLoad); } catch (e) {}
 			try { FRAME.srcdoc = ''; } catch (e) {}
@@ -1181,13 +1268,15 @@
 			return;
 		}
 
-		// 3) 浮层探针
+		// 3) 浮层探针 / 选区副本探针
 		if (d.source === SRC && d.type === 'cancel') {
 			setEntryPicking(false);
+			removeProbeOverlay();
 			return;
 		}
 		if (d.source === SRC && d.type === 'picked' && d.payload && d.payload.xpath) {
 			setEntryPicking(false);
+			removeProbeOverlay();
 			var ok3 = writeDraft(CTX, d.payload.xpath);
 			showToast(ok3 ? ('✓ 已填入 Full XPath：' + d.payload.xpath) : ('✗ 填入失败：' + LAST_ERR), !ok3);
 		}
