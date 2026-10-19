@@ -661,6 +661,22 @@
 		tryNext();
 	}
 
+	// 取目标页原文：blob: 由宿主页自己创建，直接 fetch 就能拿到；
+	// 其余（dsh-app://、跨源 http）走 host 端代理。
+	function fetchTargetHtml(src, cb) {
+		if (/^blob:/i.test(src)) {
+			fetch(src, { credentials: 'omit' })
+				.then(function (r) { return r.text(); })
+				.then(function (t) {
+					if (!t || !t.trim()) throw new Error('blob 内容为空');
+					cb(null, t);
+				})
+				.catch(function (e) { cb(new Error('blob 读取失败：' + String((e && e.message) || e))); });
+			return;
+		}
+		fetchPageHtml(src, cb);
+	}
+
 	// ── 选区副本覆盖层 ─────────────────────────────────────────────────
 	// 原预览帧（blob / 沙箱 / 跨源）宿主读不到 DOM，但可以在它上面叠一层
 	// 「同内容副本」来选区。关键：**原帧一律不动**（不 setAttribute、不写
@@ -750,13 +766,13 @@
 		}
 		OVERLAY_PENDING = true;
 
-		fetchPageHtml(src, function (err, html) {
+		fetchTargetHtml(src, function (err, html) {
 			if (!OVERLAY_PENDING) return;   // 取页期间用户已按 Esc 退出
 			OVERLAY_PENDING = false;
 			if (err) {
 				var msg = String((err && err.message) || err);
 				report('overlay-open', { ok: false, error: msg });
-				showToast('取不回预览页原文（blob/跨源预览暂不支持）', true);
+				showToast('取不回预览页原文，无法选区：' + msg.slice(0, 60), true);
 				return;
 			}
 			if (!document.body.contains(frame)) {
@@ -764,8 +780,13 @@
 				return;
 			}
 			try {
-				var base = src.replace(/[^/]*$/, '');
-				var inject = '<base href="' + base.replace(/"/g, '&quot;') + '">' + SANDBOX_PROBE_HTML;
+				// 原文自带 <base> 时不再插第二个（只认第一个，插了也没用）；
+				// blob: 没有可用的目录，不插（副本里的相对资源本就取不到）
+				var baseTag = '';
+				if (!/^blob:/i.test(src) && !/<base\b/i.test(html)) {
+					baseTag = '<base href="' + src.replace(/[^/]*$/, '').replace(/"/g, '&quot;') + '">';
+				}
+				var inject = baseTag + SANDBOX_PROBE_HTML;
 				var out = /<head\b[^>]*>/i.test(html)
 					? html.replace(/<head\b[^>]*>/i, function (m) { return m + inject; })
 					: inject + html;
