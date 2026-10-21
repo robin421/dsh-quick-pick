@@ -69,6 +69,7 @@
 	var PROBE_WAIT = null;         // { frame, timer }：已发 probe-ping，等回音
 	var LAST_PREVIEW_BAR_REPORT = 0;
 	var LAST_INPUT_COUNT = -1;
+	var LAST_INJECT_REPORT = 0;
 	// 同一窗口多次热重载保持同一标识，便于从日志区分不同客户端
 	var CLIENT_TAG = (function () {
 		try {
@@ -1415,6 +1416,18 @@
 			else bar.appendChild(createToolbarButton());
 		}
 		pruneStrayButtons();
+
+		// 注入现场诊断（15s 节流）：按钮到底挂没挂上、锚点是什么状态
+		var nowI = Date.now();
+		if (nowI - LAST_INJECT_REPORT > 15000) {
+			LAST_INJECT_REPORT = nowI;
+			report('inject-toolbar', {
+				fileBar: !!findFilePreviewToolbar(),
+				browserBar: !!findBrowserToolbar(),
+				inputs: inputs.length,
+				btns: document.querySelectorAll('.' + BTN_CLASS).length
+			});
+		}
 	}
 
 	// 清掉历史上挂到别处的按钮（"错误的入口"）
@@ -1561,6 +1574,13 @@
 					injectToolbarButtons();
 					observer.observe(document.body, { childList: true, subtree: true });
 					report('ready', envInfo({ inputs: findAddressInputs().length }));
+					// 自愈守护：MutationObserver 在 React 连续重建时可能把某一次变化
+					// 吞掉（pending 窗口内），之后按钮就再也不出现。定时幂等补挂，
+					// 无论预览/浏览器视图什么时候才渲染出来，按钮都会自己回来。
+					var heal = setInterval(function () {
+						try { injectToolbarButtons(); } catch (e) {}
+					}, 1500);
+					if (heal && heal.unref) heal.unref();
 					setTimeout(probeDom, 3000);
 					announceOnce();
 				};
