@@ -591,6 +591,40 @@
 		'if(document.body||document.documentElement)on();else document.addEventListener("DOMContentLoaded",on);' +
 		'})();<\/script>';
 
+	// Electron <webview>（内置浏览器页签）专用探针。
+	//
+	// webview 里没有可用的 parent：window.parent 就是它自己，所以老版本用
+	// postMessage 回传的结果永远到不了宿主 GUI（现象就是"点选区没反应、
+	// 没有 XPath 回写"）。这里改成把结果写进页面变量 __dqpWvResult，
+	// 由宿主用 executeJavaScript 轮询取走；同时暴露 __dqpWvOn/__dqpWvOff，
+	// 让二次点击选区、Esc 退出都能正常生效（老版本二次注入会被直接 return）。
+	var WEBVIEW_PROBE_JS = '(function(){' +
+		'if(window.__dqpWv){try{window.__dqpWvOn();}catch(e){}return "on";}' +
+		'var ov=null,hov=null,on_=false;' +
+		'function box(){if(ov)return ov;ov=document.createElement("div");ov.id="__dqp_probe_hl";' +
+		'ov.style.cssText="position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #3b82f6;background:rgba(59,130,246,.18);border-radius:3px;box-sizing:border-box;display:none;";' +
+		'(document.body||document.documentElement).appendChild(ov);return ov;}' +
+		'function xp(el){if(!el||el.nodeType!==1)return"";var t=el.tagName.toLowerCase();if(t==="html")return"/html";if(t==="body")return"/html/body";' +
+		'var s=[],c=el;while(c&&c.nodeType===1){var n=c.tagName.toLowerCase();if(n==="html")break;if(n==="body"){s.unshift("body");break;}' +
+		'var i=1,p=c.parentElement;if(p){var k=p.children;for(var j=0;j<k.length;j++){if(k[j]===c)break;if(k[j].tagName&&k[j].tagName.toLowerCase()===n)i++;}}' +
+		's.unshift(n+"["+i+"]");c=p;}return"/html/"+s.join("/");}' +
+		'function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;hov=el;var b=box(),r=el.getBoundingClientRect();' +
+		'b.style.display=(r.width||r.height)?"block":"none";b.style.left=r.left+"px";b.style.top=r.top+"px";b.style.width=r.width+"px";b.style.height=r.height+"px";}' +
+		'function onClick(e){if(!hov)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
+		'var x=xp(hov);window.__dqpWvResult={xpath:x,tag:(hov&&hov.tagName?hov.tagName.toLowerCase():"")};off();}' +
+		'function onKey(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();window.__dqpWvResult={cancel:true};off();}}' +
+		'function off(){on_=false;hov=null;document.removeEventListener("mouseover",onOver,true);document.removeEventListener("click",onClick,true);document.removeEventListener("keydown",onKey,true);' +
+		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();' +
+		'var tp=document.getElementById("__dqp_probe_tip");if(tp)tp.remove();}' +
+		'function on(){if(on_)return;on_=true;var s=document.getElementById("__dqp_probe_cursor");' +
+		'if(!s){s=document.createElement("style");s.id="__dqp_probe_cursor";s.textContent="*,* *{cursor:crosshair !important;}";(document.head||document.documentElement).appendChild(s);}' +
+		'var tip=document.getElementById("__dqp_probe_tip");if(!tip){tip=document.createElement("div");tip.id="__dqp_probe_tip";' +
+		'tip.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483646;pointer-events:none;font:500 12px/22px -apple-system,system-ui,sans-serif;text-align:center;background:rgba(15,23,42,.86);color:#e2e8f0;";' +
+		'tip.textContent="选区模式 · 点元素取 XPath · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
+		'document.addEventListener("mouseover",onOver,true);document.addEventListener("click",onClick,true);document.addEventListener("keydown",onKey,true);}' +
+		'window.__dqpWv={};window.__dqpWvOn=on;window.__dqpWvOff=off;on();return "on";' +
+		'})()';
+
 	// 退出选区：宿主侧状态 + 目标帧样式 + 沙箱探针 + web-review 开关，全部复位
 	function exitPickMode() {
 		var wasPreview = PREVIEW_PICKING;
@@ -602,6 +636,7 @@
 			PROBE_WAIT = null;
 		}
 		removeProbeOverlay();           // 撤掉选区副本（原预览帧本来就没动过）
+		stopWebviewPoll();              // 停 webview 轮询并让页面里的探针退出
 
 		if (FRAME_DOC) {
 			try {
@@ -684,6 +719,68 @@
 			return;
 		}
 		fetchPageHtml(src, cb);
+	}
+
+	// ── Electron <webview> 通道 ────────────────────────────────────────
+	// webview 内部没有可用的 parent，所以结果靠页面变量 + 轮询取回。
+	var WEBVIEW_POLL = 0;
+	var WEBVIEW_TARGET = null;
+
+	function stopWebviewPoll(silent) {
+		if (WEBVIEW_POLL) {
+			clearInterval(WEBVIEW_POLL);
+			WEBVIEW_POLL = 0;
+		}
+		var wv = WEBVIEW_TARGET;
+		WEBVIEW_TARGET = null;
+		if (wv && silent !== true) {
+			try { wv.executeJavaScript('window.__dqpWvOff && window.__dqpWvOff()', true); } catch (e) {}
+		}
+	}
+
+	function startWebviewPick(wv) {
+		stopWebviewPoll(true);
+		WEBVIEW_TARGET = wv;
+		try {
+			var r = wv.executeJavaScript(WEBVIEW_PROBE_JS, true);
+			if (r && typeof r.then === 'function') r.catch(function () {});
+		} catch (e) {
+			WEBVIEW_TARGET = null;
+			report('webview-inject-fail', { err: String((e && e.message) || e) });
+			return false;
+		}
+
+		setEntryPicking(true);
+		showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath（Esc 取消）', false);
+		report('page-frame-pick', { ok: true, how: 'webview' });
+
+		var deadline = Date.now() + 10 * 60 * 1000;
+		WEBVIEW_POLL = setInterval(function () {
+			var target = WEBVIEW_TARGET;
+			if (!target) { stopWebviewPoll(true); return; }
+			if (Date.now() > deadline) { stopWebviewPoll(); setEntryPicking(false); return; }
+			var p = null;
+			try {
+				p = target.executeJavaScript('(function(){var r=window.__dqpWvResult;if(r){window.__dqpWvResult=null;return r;}return null;})()', true);
+			} catch (e) { stopWebviewPoll(true); return; }
+			var handle = function (res) {
+				if (!res || typeof res !== 'object') return;
+				if (res.cancel) { stopWebviewPoll(); exitPickMode(); return; }
+				if (!res.xpath) return;
+				stopWebviewPoll();
+				setEntryPicking(false);
+				var wok = writeDraft(CTX, res.xpath);
+				showToast(wok ? ('✓ 已填入 Full XPath：' + res.xpath) : ('✗ 填入输入框失败：' + LAST_ERR), !wok);
+				report('picked', { source: 'webview', xpath: res.xpath });
+			};
+			if (p && typeof p.then === 'function') {
+				p.then(handle).catch(function () {});
+			} else if (p && typeof p === 'object') {
+				// 某些 webview 封装会同步返回结果
+				handle(p);
+			}
+		}, 160);
+		return true;
 	}
 
 	// ── 页面内常驻探针通道（首选）────────────────────────────────────
@@ -917,13 +1014,7 @@
 			var wv = wvs[k];
 			if (!wv.offsetWidth || wv.offsetHeight < 120) continue;
 			if (typeof wv.executeJavaScript !== 'function') continue;
-			try {
-				wv.executeJavaScript(SANDBOX_PROBE_HTML.replace(/^<script[^>]*>/, '').replace(/<\/script>$/, ''));
-				setEntryPicking(true);
-				showToast('选区已开启：在当前网页上点元素，点一下即写入 Full XPath', false);
-				report('page-frame-pick', { ok: true, how: 'webview' });
-				return true;
-			} catch (e) {}
+			if (startWebviewPick(wv)) return true;
 		}
 
 		for (var m = 0; m < sandboxCandidates.length; m++) {

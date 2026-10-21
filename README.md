@@ -23,7 +23,7 @@ DSH 右侧的预览帧是**独立沙箱文档**（`dsh-app://` 协议或独立 o
 | --- | --- |
 | `/sidebar/html` HTML 预览（首选） | host 端在 HTML 响应里注入**常驻探针**（静默，只等消息）；点选区只 `postMessage` 激活它，选中后回传 XPath。**原页面不刷新、不产生副本、滚动位置不动** |
 | 同源可读的 `iframe` | 宿主直接挂选区监听（不动页面） |
-| Electron `<webview>` | `executeJavaScript` 注入探针 |
+| Electron `<webview>` | `executeJavaScript` 注入探针；webview 内没有可用的 `parent`，结果写进页面变量 `__dqpWvResult`，由宿主用 `executeJavaScript` 轮询取回（旧版用 `postMessage` 回传，消息永远到不了宿主，表现为"点了没反应、不回写 XPath"） |
 | 老预览文档 / 其它沙箱或不跨源帧 | 退回**选区副本覆盖层**：host 端代理取回原文＋内联探针，叠在原帧位置。原帧仍不改写，不会刷新 |
 
 ## 安装
