@@ -1354,13 +1354,32 @@
 		return out;
 	}
 
-	// 内置浏览器的工具栏本体（兜底锚点）：即使地址栏换了元素形态也能挂上
+	// 内置浏览器的工具栏本体：必须是**包含地址栏的那一整行**。
+	// 不能直接挂到 input.parentElement —— 那通常只是包住输入框的窄容器，
+	// 按钮会被挤到下一行、跑到地址栏下面（截图里那个"很奇怪"的蓝点）。
 	function findBrowserToolbar() {
-		var bars = document.querySelectorAll('[class*="iGvAsW_toolbar"]');
+		var bars = document.querySelectorAll('[class*="toolbar" i]');
 		for (var i = 0; i < bars.length; i++) {
-			if (PANEL && PANEL.contains(bars[i])) continue;
-			if (!bars[i].offsetWidth && !bars[i].offsetHeight) continue;
-			return bars[i];
+			var bar = bars[i];
+			if (PANEL && PANEL.contains(bar)) continue;
+			if (!bar.offsetWidth && !bar.offsetHeight) continue;
+			// 工具栏里得真的含地址栏，才算浏览器工具栏（避免误挂到别的工具条）
+			var hasAddr = bar.querySelector(
+				'input[placeholder*="HTTP"], input[placeholder*="网址"], input[placeholder*="URL" i], input[class*="address" i]'
+			);
+			if (!hasAddr) continue;
+			return bar;
+		}
+		// 兜底：从地址栏输入框向上找最近的、含多个按钮的可见行
+		var inputs = findAddressInputs();
+		for (var j = 0; j < inputs.length; j++) {
+			var el = inputs[j].parentElement;
+			for (var depth = 0; el && depth < 6; depth++, el = el.parentElement) {
+				if (!el || el === document.body || el === document.documentElement) break;
+				if (!(el.offsetWidth || el.offsetHeight)) break;
+				var btnCount = el.querySelectorAll('button, [role="button"]').length;
+				if (btnCount >= 2 && el.querySelector('input')) return el;
+			}
 		}
 		return null;
 	}
@@ -1404,7 +1423,9 @@
 		// 全程只有一个按钮（单例），锚点变了就「移动」过去，不删不建：
 		// 这样无论 React 怎么重建工具栏，按钮要么在原位、要么被挪到新行，
 		// 不会出现反复注入 / 反复消失的闪烁。
+		// 锚点优先级：网页预览工具栏 > 内置浏览器工具栏整行 > 地址栏窄容器（最后兜底）
 		var anchor = findFilePreviewToolbar();
+		if (!anchor) anchor = findBrowserToolbar();
 		if (!anchor) {
 			var inputs = findAddressInputs();
 			for (var i = 0; i < inputs.length; i++) {
@@ -1415,7 +1436,6 @@
 				break;
 			}
 		}
-		if (!anchor) anchor = findBrowserToolbar();
 
 		if (!anchor) {
 			// 没有可挂载的视图：把按钮收起来（仍留在 DOM 里，等下次移动回去）
