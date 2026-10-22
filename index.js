@@ -25,7 +25,7 @@ const PROBE_SCRIPT = [
 	"HL.style.cssText='position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #3b82f6;background:rgba(59,130,246,.18);border-radius:3px;box-sizing:border-box;display:none;';",
 	"(document.body||document.documentElement).appendChild(HL);return HL}",
 	"function tip(){if(TIP)return TIP;TIP=document.createElement('div');TIP.id='__dqp_tip';",
-	"TIP.style.cssText='position:fixed;left:0;right:0;top:0;z-index:2147483646;pointer-events:none;font:500 12px/22px -apple-system,system-ui,sans-serif;text-align:center;background:rgba(15,23,42,.86);color:#e2e8f0;';",
+	"TIP.style.cssText='position:fixed;right:12px;bottom:12px;z-index:2147483646;pointer-events:none;font:500 12px/1 -apple-system,system-ui,sans-serif;background:rgba(15,23,42,.82);color:#e2e8f0;padding:7px 11px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.22);';",
 	"TIP.textContent='选区模式 · 点元素取 XPath · Esc 退出';(document.body||document.documentElement).appendChild(TIP);return TIP}",
 	"function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;H=el;var b=hl(),r=el.getBoundingClientRect();",
 	"b.style.display=(r.width||r.height)?'block':'none';b.style.left=r.left+'px';b.style.top=r.top+'px';b.style.width=r.width+'px';b.style.height=r.height+'px'}",
@@ -202,7 +202,7 @@ export function apply(ctx) {
 					'content-type': 'application/json; charset=utf-8',
 					'cache-control': 'no-store'
 				});
-				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.2' }));
+				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.4' }));
 			}
 		}), 'dsh-quick-pick: ping');
 

@@ -285,9 +285,10 @@
 			return true;
 		}
 
-		// 3) 都不可用：把现场信息写进输入框（网络日志通道不通时的唯一定位手段）
+		// 3) 都不可用：提示换内置浏览器打开（那里有 webview 探针，能原地选区），
+		//    并把现场信息写进输入框，方便不开控制台也能定位。
 		var probe = probePickCandidates();
-		showToast('当前网页读不到 DOM（跨源沙箱），现场信息已写入输入框', true);
+		showToast('这个网页读不到 DOM：点地址栏用内置浏览器打开该网址，再点 ✦ 选区', true);
 		report('preview-pick', { ok: false, reason: 'no-channel', probe: probe });
 		reportToDraft('无法在当前网页选区', probe);
 		return false;
@@ -584,7 +585,7 @@
 		'function on(){if(on_)return;on_=true;var s=document.getElementById("__dqp_probe_cursor");' +
 		'if(!s){s=document.createElement("style");s.id="__dqp_probe_cursor";s.textContent="*,* *{cursor:crosshair !important;}";(document.head||document.documentElement).appendChild(s);}' +
 		'var tip=document.getElementById("__dqp_probe_tip");if(!tip){tip=document.createElement("div");tip.id="__dqp_probe_tip";' +
-		'tip.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483646;pointer-events:none;font:500 12px/22px -apple-system,system-ui,sans-serif;text-align:center;background:rgba(15,23,42,.86);color:#e2e8f0;";' +
+		'tip.style.cssText="position:fixed;right:12px;bottom:12px;z-index:2147483646;pointer-events:none;font:500 12px/1 -apple-system,system-ui,sans-serif;background:rgba(15,23,42,.82);color:#e2e8f0;padding:7px 11px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.22);";' +
 		'tip.textContent="选区副本 · 原页面未刷新 · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
 		'document.addEventListener("mouseover",onOver,true);document.addEventListener("click",onClick,true);document.addEventListener("keydown",onKey,true);}' +
 		'window.addEventListener("message",function(ev){var d=ev.data;if(!d||d.source!=="dsh-quick-pick")return;' +
@@ -620,7 +621,7 @@
 		'function on(){if(on_)return;on_=true;var s=document.getElementById("__dqp_probe_cursor");' +
 		'if(!s){s=document.createElement("style");s.id="__dqp_probe_cursor";s.textContent="*,* *{cursor:crosshair !important;}";(document.head||document.documentElement).appendChild(s);}' +
 		'var tip=document.getElementById("__dqp_probe_tip");if(!tip){tip=document.createElement("div");tip.id="__dqp_probe_tip";' +
-		'tip.style.cssText="position:fixed;top:0;left:0;right:0;z-index:2147483646;pointer-events:none;font:500 12px/22px -apple-system,system-ui,sans-serif;text-align:center;background:rgba(15,23,42,.86);color:#e2e8f0;";' +
+		'tip.style.cssText="position:fixed;right:12px;bottom:12px;z-index:2147483646;pointer-events:none;font:500 12px/1 -apple-system,system-ui,sans-serif;background:rgba(15,23,42,.82);color:#e2e8f0;padding:7px 11px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.22);";' +
 		'tip.textContent="选区模式 · 点元素取 XPath · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
 		'document.addEventListener("mouseover",onOver,true);document.addEventListener("click",onClick,true);document.addEventListener("keydown",onKey,true);}' +
 		'window.__dqpWv={};window.__dqpWvOn=on;window.__dqpWvOff=off;on();return "on";' +
@@ -1026,7 +1027,16 @@
 				report('page-frame-pick', { ok: true, how: 'probe-wait', src: String(cand.getAttribute('src') || '').slice(0, 100) });
 				return true;
 			}
-			// 听不到探针（老预览文档）：在原帧上叠一层选区副本，原帧保持不动
+			// 跨源的普通网页（http/https 外站）：叠副本会是一份「新加载、从顶部开始、
+			// 不执行脚本」的复印件，观感很差（用户反馈在飞书网页上「界面很怪」）。
+			// 这种页面改为提示用内置浏览器打开——那里有 webview 探针，能原地选区。
+			var srcAttr = '';
+			try { srcAttr = String(cand.getAttribute('src') || ''); } catch (e) {}
+			if (/^(https?:)?\/\//i.test(srcAttr) && srcAttr.indexOf(location.origin) !== 0) {
+				report('page-frame-pick', { ok: false, how: 'cross-origin-skip', src: srcAttr.slice(0, 100) });
+				continue;
+			}
+			// 本地预览文档（/sidebar/html、dsh-app 等）：叠一层选区副本，原帧保持不动
 			if (injectSandboxFrame(cand)) {
 				report('page-frame-pick', { ok: true, how: 'sandbox-overlay', src: String(cand.getAttribute('src') || '').slice(0, 100) });
 				return true;
@@ -1286,7 +1296,8 @@
 			var label = (b.getAttribute('aria-label') || '') + ' ' + (b.title || '') + ' ' + (b.textContent || '');
 			if (!/temporarily disable|sandbox|沙箱|临时关闭|临时禁用/i.test(label)) continue;
 			var bar = b.parentElement;
-			if (bar) return bar;
+			// 只挂可见的那一行：隐藏页签里的旧工具栏不算锚点，否则按钮看不见
+			if (bar && (bar.offsetWidth || bar.offsetHeight)) return bar;
 		}
 		// 退而求其次：含「预览 / 编辑」切换的那一行
 		var pv = document.querySelectorAll('button, [role="button"]');
@@ -1294,7 +1305,11 @@
 			var p = pv[j];
 			var l2 = (p.getAttribute('aria-label') || '') + ' ' + (p.title || '') + ' ' + (p.textContent || '');
 			if (!/^(预览|编辑|preview|edit)$/i.test(l2.trim())) continue;
-			if (p.parentElement && p.parentElement.parentElement) return p.parentElement.parentElement;
+			// 只取这个切换按钮所在的那一行；绝不能是 body（否则按钮会挂到
+			// 页面末尾，也就是用户反馈的「打开网页后界面很怪」）
+			var pb = p.parentElement;
+			if (pb && pb !== document.body && pb !== document.documentElement &&
+				(pb.offsetWidth || pb.offsetHeight)) return pb;
 		}
 		return null;
 	}
@@ -1304,11 +1319,17 @@
 		var on = PICKING || PREVIEW_PICKING;
 		var btns = document.querySelectorAll('.' + BTN_CLASS);
 		for (var i = 0; i < btns.length; i++) {
+			// 状态没变就不动 DOM：避免每次 reconcile 都重排按钮
+			if (btns[i].__dqpOn === on) continue;
+			btns[i].__dqpOn = on;
 			btns[i].innerHTML = on
-				? '<span style="color:#22c55e;margin-right:4px;">●</span><span>选区中…</span>'
-				: '<span style="color:#60a5fa;margin-right:4px;">✦</span><span>选区 (XPath)</span>';
-			btns[i].style.borderColor = on ? '#22c55e' : '#3b82f6';
-			btns[i].style.background = on ? 'rgba(34,197,94,0.22)' : 'rgba(59,130,246,0.12)';
+				? '<span style="color:#22c55e;">●</span>'
+				: '<span style="color:#60a5fa;">✦</span>';
+			btns[i].title = on
+				? '选区进行中：在页面上点元素即写入 Full XPath（Esc 退出）'
+				: 'XPath 选区：在当前网页上点选元素，把 Full XPath 填进输入框 (Cmd/Ctrl+Shift+E)';
+			btns[i].style.borderColor = on ? 'rgba(34,197,94,0.7)' : 'rgba(59,130,246,0.55)';
+			btns[i].style.background = on ? 'rgba(34,197,94,0.18)' : 'rgba(59,130,246,0.12)';
 			btns[i].style.color = on ? '#86efac' : '#93c5fd';
 		}
 	}
@@ -1344,17 +1365,24 @@
 		return null;
 	}
 
+	// 工具栏按钮是**单例**：全程只有一个元素，锚点变化时只移动它，
+	// 绝不反复删除重建（反复重建会闪烁，也容易在 React 重渲染时被吞掉）。
+	var TOOLBAR_BTN = null;
+
 	function createToolbarButton() {
+		if (TOOLBAR_BTN && TOOLBAR_BTN.isConnected) return TOOLBAR_BTN;
 		var btn = document.createElement('button');
 		btn.className = BTN_CLASS;
+		btn.id = '__dqp_tb';
 		btn.type = 'button';
 		btn.title = 'XPath 选区：在当前网页上点选元素，把 Full XPath 填进输入框 (Cmd/Ctrl+Shift+E)';
+		// 紧凑图标按钮：不占宽度、不换行，避免把浏览器地址栏挤变形
 		btn.style.cssText =
-			'display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:6px;' +
-			'font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;border:1px solid #3b82f6;' +
-			'background:rgba(59,130,246,0.12);color:#93c5fd;flex:none;margin-left:6px;margin-right:4px;' +
-			'transition:all 0.15s;user-select:none;';
-		btn.innerHTML = '<span style="color:#60a5fa;margin-right:4px;">✦</span><span>选区 (XPath)</span>';
+			'display:inline-flex;align-items:center;justify-content:center;height:24px;min-width:24px;padding:0 5px;border-radius:6px;' +
+			'font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;border:1px solid rgba(59,130,246,0.55);' +
+			'background:rgba(59,130,246,0.12);color:#93c5fd;flex:none;margin-left:4px;margin-right:2px;' +
+			'transition:background 0.15s;user-select:none;line-height:1;';
+		btn.innerHTML = '<span style="color:#60a5fa;">✦</span>';
 
 		btn.addEventListener('mouseenter', function () {
 			if (!PICKING) this.style.background = 'rgba(59,130,246,0.24)';
@@ -1367,89 +1395,80 @@
 			e.stopPropagation();
 			startPreviewPick();
 		});
+		TOOLBAR_BTN = btn;
 		return btn;
 	}
 
 	function injectToolbarButtons() {
-		// 右侧预览区两种形态，各自挂各自那一行（互不冲突）：
-		//   1) HTML 文件预览 → 沙箱提示条那一行
-		//   2) 内置浏览器 → 地址栏那一行
-		var previewBar = findFilePreviewToolbar();
-		if (previewBar && !previewBar.querySelector('.' + BTN_CLASS)) {
-			previewBar.appendChild(createToolbarButton());
-			// 上报节流：预览工具栏会被 React 反复重建，不加节流会把日志刷爆
-			var nowTs = Date.now();
-			if (nowTs - LAST_PREVIEW_BAR_REPORT > 10000) {
-				LAST_PREVIEW_BAR_REPORT = nowTs;
-				report('file-preview-entry', { cls: String(previewBar.className || '').slice(0, 40) });
+		// 锚点优先级：网页预览工具栏（沙箱提示行）> 内置浏览器地址栏所在行。
+		// 全程只有一个按钮（单例），锚点变了就「移动」过去，不删不建：
+		// 这样无论 React 怎么重建工具栏，按钮要么在原位、要么被挪到新行，
+		// 不会出现反复注入 / 反复消失的闪烁。
+		var anchor = findFilePreviewToolbar();
+		if (!anchor) {
+			var inputs = findAddressInputs();
+			for (var i = 0; i < inputs.length; i++) {
+				var ip = inputs[i].parentElement;
+				if (!ip) continue;
+				if (!ip.offsetWidth && !ip.offsetHeight) continue;   // 隐藏页签跳过
+				anchor = ip;
+				break;
 			}
 		}
+		if (!anchor) anchor = findBrowserToolbar();
 
-		var inputs = findAddressInputs();
-		var browserBar = findBrowserToolbar();
-		if (browserBar && inputs.length === 0 && !browserBar.querySelector('.' + BTN_CLASS)) {
-			browserBar.appendChild(createToolbarButton());
-			var bbTs = Date.now();
-			if (bbTs - LAST_PREVIEW_BAR_REPORT > 10000) {
-				LAST_PREVIEW_BAR_REPORT = bbTs;
-				report('browser-bar-entry', { cls: String(browserBar.className || '').slice(0, 40) });
+		if (!anchor) {
+			// 没有可挂载的视图：把按钮收起来（仍留在 DOM 里，等下次移动回去）
+			if (TOOLBAR_BTN && TOOLBAR_BTN.parentElement) {
+				try { TOOLBAR_BTN.remove(); } catch (e) {}
 			}
+			reportInject(0);
+			return;
 		}
-		if (inputs.length !== LAST_INPUT_COUNT) {
-			LAST_INPUT_COUNT = inputs.length;
-			var samples = [];
-			for (var s = 0; s < inputs.length && s < 6; s++) {
-				samples.push({
-					ph: String(inputs[s].getAttribute('placeholder') || '').slice(0, 40),
-					cls: String(inputs[s].className || '').slice(0, 60),
-					inWV: !!(inputs[s].closest && inputs[s].closest('[data-webview-ui]'))
-				});
-			}
-			report('address-inputs', { count: inputs.length, samples: samples });
+		var btn = createToolbarButton();
+
+		if (btn.parentElement !== anchor) {
+			try { anchor.appendChild(btn); } catch (e) { return; }
+			reportInject(anchor === findFilePreviewToolbar() ? 1 : 2);
 		}
-		for (var i = 0; i < inputs.length; i++) {
-			var input = inputs[i];
-			var bar = input.parentElement;
-			if (!bar) continue;
-			if (bar.querySelector('.' + BTN_CLASS)) continue;
-			if (input.nextSibling) bar.insertBefore(createToolbarButton(), input.nextSibling);
-			else bar.appendChild(createToolbarButton());
-		}
+		renderToolbarButtons();
 		pruneStrayButtons();
 
-		// 注入现场诊断（15s 节流）：按钮到底挂没挂上、锚点是什么状态
-		var nowI = Date.now();
-		if (nowI - LAST_INJECT_REPORT > 15000) {
-			LAST_INJECT_REPORT = nowI;
-			report('inject-toolbar', {
-				fileBar: !!findFilePreviewToolbar(),
-				browserBar: !!findBrowserToolbar(),
-				inputs: inputs.length,
-				btns: document.querySelectorAll('.' + BTN_CLASS).length
-			});
+		// 地址栏现场诊断（仅在数量变化时上报，避免刷日志）
+		var inputs2 = findAddressInputs();
+		if (inputs2.length !== LAST_INPUT_COUNT) {
+			LAST_INPUT_COUNT = inputs2.length;
+			var samples = [];
+			for (var s2 = 0; s2 < inputs2.length && s2 < 6; s2++) {
+				samples.push({
+					ph: String(inputs2[s2].getAttribute('placeholder') || '').slice(0, 40),
+					cls: String(inputs2[s2].className || '').slice(0, 60),
+					inWV: !!(inputs2[s2].closest && inputs2[s2].closest('[data-webview-ui]'))
+				});
+			}
+			report('address-inputs', { count: inputs2.length, samples: samples });
 		}
 	}
 
-	// 清掉历史上挂到别处的按钮（"错误的入口"）
-	// 判断口径与注入完全一致：只保留挂在候选地址栏容器里的按钮。
-	function pruneStrayButtons() {
-		var bars = [];
-		var inputs = findAddressInputs();
-		for (var i = 0; i < inputs.length; i++) {
-			var parent = inputs[i].parentElement;
-			if (parent && bars.indexOf(parent) < 0) bars.push(parent);
-		}
-		var fpb = findFilePreviewToolbar();
-		if (fpb && bars.indexOf(fpb) < 0) bars.push(fpb);
-		var bb = findBrowserToolbar();
-		if (bb && bars.indexOf(bb) < 0) bars.push(bb);
+	function reportInject(mode) {
+		var nowI = Date.now();
+		if (nowI - LAST_INJECT_REPORT < 15000) return;
+		LAST_INJECT_REPORT = nowI;
+		report('inject-toolbar', {
+			mode: mode,
+			fileBar: !!findFilePreviewToolbar(),
+			browserBar: !!findBrowserToolbar(),
+			inputs: findAddressInputs().length,
+			btns: document.querySelectorAll('.' + BTN_CLASS).length
+		});
+	}
 
+	// 只清掉历史上遗留的多余按钮（单例之外），绝不碰当前这个
+	function pruneStrayButtons() {
 		var btns = document.querySelectorAll('.' + BTN_CLASS);
-		for (var j = 0; j < btns.length; j++) {
-			var btn = btns[j];
-			if (bars.indexOf(btn.parentElement) >= 0) continue;
-			report('prune-stray-button', { cls: btn.parentElement ? String(btn.parentElement.className).slice(0, 60) : '' });
-			try { btn.remove(); } catch (e) {}
+		for (var i = 0; i < btns.length; i++) {
+			if (TOOLBAR_BTN && btns[i] === TOOLBAR_BTN) continue;
+			try { btns[i].remove(); } catch (e) {}
 		}
 	}
 
