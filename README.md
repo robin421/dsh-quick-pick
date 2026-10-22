@@ -34,6 +34,11 @@ DSH 右侧的预览帧是**独立沙箱文档**（`dsh-app://` 协议或独立 o
 - **Shift + 点击**取的是它所点击元素的**父级**（点到了内部小图标/文字时用这个升一层）；
 - `Esc` 退出选区模式。
 
+选中的元素会被打上**唯一标记** `data-dqp-pick="dqp-…"`，写进输入框的是它的唯一选择器
+`[data-dqp-pick="dqp-…"]`——页面上绝对唯一、同一个元素重选标记不变，不会像
+`div[3]/span[2]` 那种位置型 XPath 一样漂移或命中外一个元素。Full XPath 仍会记录在
+`~/.dsh/logs/quick-pick.log` 的 `picked` 事件里备查。
+
 ## 安装
 
 1. 把本目录放到 `~/.dsh/plugins/dsh-quick-pick`

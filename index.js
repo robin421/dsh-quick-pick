@@ -29,8 +29,9 @@ const PROBE_SCRIPT = [
 	"TIP.textContent='选区模式 · Shift+点击选父级 · Esc 退出';(document.body||document.documentElement).appendChild(TIP);return TIP}",
 	"function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;H=el;var b=hl(),r=el.getBoundingClientRect();",
 	"b.style.display=(r.width||r.height)?'block':'none';b.style.left=r.left+'px';b.style.top=r.top+'px';b.style.width=r.width+'px';b.style.height=r.height+'px'}",
-	"function onClick(e){if(!A)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();var el=(e.target&&e.target.nodeType===1)?e.target:H;if(!el)return;if(e.shiftKey&&el.parentElement&&el.parentElement!==document.documentElement)el=el.parentElement;var x=xp(el);off();",
-	"send({source:'dsh-quick-pick',type:'picked',payload:{xpath:x,tag:el&&el.tagName?el.tagName.toLowerCase():''}})}",
+	"function mk(el){try{var m=el.getAttribute&&el.getAttribute('data-dqp-pick');if(m)return m;m='dqp-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,6);el.setAttribute('data-dqp-pick',m);return m;}catch(err){return ''}}",
+	"function onClick(e){if(!A)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();var el=(e.target&&e.target.nodeType===1)?e.target:H;if(!el)return;if(e.shiftKey&&el.parentElement&&el.parentElement!==document.documentElement)el=el.parentElement;var x=xp(el);var m=mk(el);off();",
+	"send({source:'dsh-quick-pick',type:'picked',payload:{xpath:x,mark:m,selector:m?'[data-dqp-pick=\"'+m+'\"]':'',tag:el&&el.tagName?el.tagName.toLowerCase():''}})}",
 	"function onKey(e){if(e.key==='Escape'&&A){e.preventDefault();e.stopPropagation();off();send({source:'dsh-quick-pick',type:'cancel'})}}",
 	"function on(){if(A)return;A=true;if(!ST){ST=document.createElement('style');ST.id='__dqp_cur';ST.textContent='*,* *{cursor:crosshair !important;}';document.head&&document.head.appendChild(ST)}",
 	"tip().style.display='block';document.addEventListener('mouseover',onOver,true);document.addEventListener('click',onClick,true);document.addEventListener('keydown',onKey,true)}",
@@ -202,7 +203,7 @@ export function apply(ctx) {
 					'content-type': 'application/json; charset=utf-8',
 					'cache-control': 'no-store'
 				});
-				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.3.0' }));
+				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.3.1' }));
 			}
 		}), 'dsh-quick-pick: ping');
 

@@ -584,7 +584,7 @@
 		'function onClick(e){var el=(e.target&&e.target.nodeType===1)?e.target:hov;if(!el)return;' +
 		'e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
 		'if(e.shiftKey&&el.parentElement&&el.parentElement!==document.documentElement)el=el.parentElement;' +
-		'var x=xp(el);try{window.parent.postMessage({source:"dsh-quick-pick",type:"picked",payload:{xpath:x,tag:el.tagName.toLowerCase()}},"*");}catch(err){}off();}' +
+		'var x=xp(el);var m="";try{m=el.getAttribute("data-dqp-pick")||"";if(!m){m="dqp-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,6);el.setAttribute("data-dqp-pick",m);}}catch(err){}try{window.parent.postMessage({source:"dsh-quick-pick",type:"picked",payload:{xpath:x,mark:m,tag:el.tagName.toLowerCase()}},"*");}catch(err){}off();}' +
 		'function onKey(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();off();try{window.parent.postMessage({source:"dsh-quick-pick",type:"cancel"},"*");}catch(err){}}}' +
 		'function off(){on_=false;hov=null;document.removeEventListener("mouseover",onOver,true);document.removeEventListener("click",onClick,true);document.removeEventListener("keydown",onKey,true);' +
 		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();' +
@@ -622,7 +622,7 @@
 		'function onClick(e){var el=(e.target&&e.target.nodeType===1)?e.target:hov;if(!el)return;' +
 		'e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
 		'if(e.shiftKey&&el.parentElement&&el.parentElement!==document.documentElement)el=el.parentElement;' +
-		'var x=xp(el);window.__dqpWvResult={xpath:x,tag:(el&&el.tagName?el.tagName.toLowerCase():"")};off();}' +
+		'var x=xp(el);var m="";try{m=el.getAttribute("data-dqp-pick")||"";if(!m){m="dqp-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,6);el.setAttribute("data-dqp-pick",m);}}catch(err){}window.__dqpWvResult={xpath:x,mark:m,tag:(el&&el.tagName?el.tagName.toLowerCase():"")};off();}' +
 		'function onKey(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();window.__dqpWvResult={cancel:true};off();}}' +
 		'function off(){on_=false;hov=null;document.removeEventListener("mouseover",onOver,true);document.removeEventListener("click",onClick,true);document.removeEventListener("keydown",onKey,true);' +
 		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();' +
@@ -777,12 +777,13 @@
 			var handle = function (res) {
 				if (!res || typeof res !== 'object') return;
 				if (res.cancel) { stopWebviewPoll(); exitPickMode(); return; }
-				if (!res.xpath) return;
+				if (!res.xpath && !res.mark) return;
 				stopWebviewPoll();
 				setEntryPicking(false);
-				var wok = writeDraft(CTX, res.xpath);
-				showToast(wok ? ('✓ 已填入 Full XPath：' + res.xpath) : ('✗ 填入输入框失败：' + LAST_ERR), !wok);
-				report('picked', { source: 'webview', xpath: res.xpath });
+				var wref = refFromPayload(res);
+				var wok = writeDraft(CTX, wref);
+				showToast(wok ? ('✓ 已标记：' + wref + '（唯一，不会重复）') : ('✗ 填入输入框失败：' + LAST_ERR), !wok);
+				report('picked', { source: 'webview', xpath: res.xpath, mark: res.mark, ref: wref });
 			};
 			if (p && typeof p.then === 'function') {
 				p.then(handle).catch(function () {});
@@ -1097,23 +1098,52 @@
 		else startPick();
 	}
 
+	// ── 唯一标记：给元素打一个不会重复的 data 属性，回写选择器 ───────────
+	// XPath 里 div[3] 这类位置索引在动态页面上会漂移、可能命中别的元素，
+	// 所以选区后一律给元素打上唯一标记 data-dqp-pick="dqp-..."，回写
+	// [data-dqp-pick="..."] 这种选择器：页面上绝对唯一，重选也不会变。
+	function markElement(el) {
+		try {
+			var m = el.getAttribute && el.getAttribute('data-dqp-pick');
+			if (m) return m;
+			m = 'dqp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+			el.setAttribute('data-dqp-pick', m);
+			return m;
+		} catch (e) {
+			return '';
+		}
+	}
+
+	function refOf(mark, selector, xpath) {
+		if (selector) return selector;
+		if (mark) return '[data-dqp-pick="' + mark + '"]';
+		return xpath || '';
+	}
+
+	function refFromPayload(p) {
+		if (!p) return '';
+		return refOf(p.mark, p.selector, p.xpath);
+	}
+
 	// ── 选中回调 ───────────────────────────────────────────────────────
 	function onPicked(el) {
 		var xpath = fullXPath(el);
+		var mark = markElement(el);
+		var ref = refOf(mark, '', xpath);
 		stopPick(true);
-		if (!xpath) {
-			showToast('✗ 未能提取 XPath', true);
+		if (!ref) {
+			showToast('✗ 未能标记元素', true);
 			return;
 		}
-		var ok = writeDraft(CTX, xpath);
+		var ok = writeDraft(CTX, ref);
 		if (ok) {
-			showToast('✓ 已填入 Full XPath：' + xpath, false);
-			setStatus('已填入输入框：' + xpath);
+			showToast('✓ 已标记：' + ref + '（唯一，不会重复）', false);
+			setStatus('已标记：' + ref);
 		} else {
 			showToast('✗ 填入输入框失败：' + (LAST_ERR || '未知原因'), true);
 			setStatus('填入输入框失败：' + (LAST_ERR || ''), true);
 		}
-		report('picked', { xpath: xpath, tag: el.tagName ? el.tagName.toLowerCase() : '', ok: ok });
+		report('picked', { xpath: xpath, mark: mark, ref: ref, tag: el.tagName ? el.tagName.toLowerCase() : '', ok: ok });
 	}
 
 	// ── 面板 ───────────────────────────────────────────────────────────
@@ -1698,11 +1728,13 @@
 			removeProbeOverlay();
 			return;
 		}
-		if (d.source === SRC && d.type === 'picked' && d.payload && d.payload.xpath) {
+		if (d.source === SRC && d.type === 'picked' && d.payload && (d.payload.mark || d.payload.xpath)) {
 			setEntryPicking(false);
 			removeProbeOverlay();
-			var ok3 = writeDraft(CTX, d.payload.xpath);
-			showToast(ok3 ? ('✓ 已填入 Full XPath：' + d.payload.xpath) : ('✗ 填入失败：' + LAST_ERR), !ok3);
+			var ref3 = refFromPayload(d.payload);
+			var ok3 = writeDraft(CTX, ref3);
+			showToast(ok3 ? ('✓ 已标记：' + ref3 + '（唯一，不会重复）') : ('✗ 填入失败：' + LAST_ERR), !ok3);
+			report('picked', { source: 'probe', xpath: d.payload.xpath, mark: d.payload.mark, ref: ref3, ok: ok3 });
 		}
 	});
 
