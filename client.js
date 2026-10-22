@@ -1396,6 +1396,7 @@
 	// 工具栏按钮是**单例**：全程只有一个元素，锚点变化时只移动它，
 	// 绝不反复删除重建（反复重建会闪烁，也容易在 React 重渲染时被吞掉）。
 	var TOOLBAR_BTN = null;
+	var LAST_TOP_INFO = '';
 
 	function createToolbarButton() {
 		if (TOOLBAR_BTN && TOOLBAR_BTN.isConnected) return TOOLBAR_BTN;
@@ -1433,30 +1434,50 @@
 		return btn;
 	}
 
-	// 会话页/开始页右上角的图标行（"视图选项"那一排）。
-	// 选区按钮优先挂在这里：位置固定、不会被预览工具栏重建带走。
+	// 会话页/开始页右上角的图标行。
+	// 不依赖某个 aria-label（真实 DSH 里那排图标没有统一标签），改为按几何特征找：
+	// 视口顶部右侧、宽 90~420px、高 20~72px、含 2~8 个可见图标子元素、不含输入框/网页视图。
 	function findTopbarRow() {
-		var all = document.querySelectorAll('button, [role="button"]');
+		var vw = window.innerWidth || 1200;
+		var all = document.querySelectorAll('body *');
+		var best = null, bestScore = -1e9, bestInfo = null;
 		for (var i = 0; i < all.length; i++) {
-			var b = all[i];
-			var l = (b.getAttribute('aria-label') || '') + ' ' + (b.title || '');
-			if (!/视图选项/.test(l)) continue;
-			var row = b.parentElement;
-			if (!row) continue;
-			if (!(row.offsetWidth || row.offsetHeight)) continue;
-			// 只认「视口右上角」那一行：侧边栏里的旧"视图选项"在左侧/中部，排除掉
-			var rect = row.getBoundingClientRect();
-			var vw = window.innerWidth || 1200;
-			if (rect.top > 180) continue;
-			if (rect.right < vw * 0.6) continue;
-			var visible = 0;
-			for (var k = 0; k < row.children.length; k++) {
-				var ch = row.children[k];
-				if (ch.offsetWidth || ch.offsetHeight) visible++;
+			var el = all[i];
+			if (el === document.body || el === document.documentElement) continue;
+			if (el.id === PANEL_ID || el.id === TOAST_ID || el.id === '__dqp_tb') continue;
+			if (el.closest && el.closest('#' + PANEL_ID)) continue;
+			var r = el.getBoundingClientRect();
+			if (r.width < 90 || r.width > 420) continue;
+			if (r.height < 20 || r.height > 72) continue;
+			if (r.top < -5 || r.top > 120) continue;
+			if (r.left < vw * 0.55) continue;
+			if (el.querySelector('input, textarea, webview, iframe')) continue;
+			var kids = 0, btnKids = 0, minW = 1e9, maxW = 0;
+			for (var k = 0; k < el.children.length; k++) {
+				var ch = el.children[k];
+				var cr = ch.getBoundingClientRect();
+				if (cr.width <= 0 || cr.height <= 0) continue;
+				kids++;
+				if (ch.tagName === 'BUTTON' || ch.tagName === 'A' || ch.getAttribute('role') === 'button' ||
+					ch.querySelector('button, [role="button"], svg, img')) btnKids++;
+				minW = Math.min(minW, cr.width);
+				maxW = Math.max(maxW, cr.width);
 			}
-			if (visible >= 3) return row;
+			if (kids < 2 || kids > 8) continue;
+			// 图标按钮大小相近（不是被拉满的整行容器）
+			if (maxW > 90) continue;
+			var score = kids * 12 + (btnKids >= 2 ? 40 : 0) - Math.abs(r.right - vw) * 0.2 - Math.abs(r.top - 26) * 0.3;
+			if (score > bestScore) {
+				bestScore = score;
+				best = el;
+				bestInfo = { cls: String(el.className || '').slice(0, 50), n: kids, btn: btnKids, w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top), right: Math.round(r.right) };
+			}
 		}
-		return null;
+		if (best) {
+			var key = JSON.stringify(bestInfo);
+			if (key !== LAST_TOP_INFO) { LAST_TOP_INFO = key; report('topbar-row', bestInfo); }
+		}
+		return best;
 	}
 
 	// 隐藏图标行里左起第二个图标（用户确认废弃的那个）。

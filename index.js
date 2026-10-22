@@ -202,7 +202,7 @@ export function apply(ctx) {
 					'content-type': 'application/json; charset=utf-8',
 					'cache-control': 'no-store'
 				});
-				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.9' }));
+				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.3.0' }));
 			}
 		}), 'dsh-quick-pick: ping');
 
