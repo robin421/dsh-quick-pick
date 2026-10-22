@@ -26,10 +26,10 @@ const PROBE_SCRIPT = [
 	"(document.body||document.documentElement).appendChild(HL);return HL}",
 	"function tip(){if(TIP)return TIP;TIP=document.createElement('div');TIP.id='__dqp_tip';",
 	"TIP.style.cssText='position:fixed;right:12px;bottom:12px;z-index:2147483646;pointer-events:none;font:500 12px/1 -apple-system,system-ui,sans-serif;background:rgba(15,23,42,.82);color:#e2e8f0;padding:7px 11px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.22);';",
-	"TIP.textContent='选区模式 · 点元素取 XPath · Esc 退出';(document.body||document.documentElement).appendChild(TIP);return TIP}",
+	"TIP.textContent='选区模式 · Shift+点击选父级 · Esc 退出';(document.body||document.documentElement).appendChild(TIP);return TIP}",
 	"function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;H=el;var b=hl(),r=el.getBoundingClientRect();",
 	"b.style.display=(r.width||r.height)?'block':'none';b.style.left=r.left+'px';b.style.top=r.top+'px';b.style.width=r.width+'px';b.style.height=r.height+'px'}",
-	"function onClick(e){if(!A)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();var el=H||e.target;var x=xp(el);off();",
+	"function onClick(e){if(!A)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();var el=(e.target&&e.target.nodeType===1)?e.target:H;if(!el)return;if(e.shiftKey&&el.parentElement&&el.parentElement!==document.documentElement)el=el.parentElement;var x=xp(el);off();",
 	"send({source:'dsh-quick-pick',type:'picked',payload:{xpath:x,tag:el&&el.tagName?el.tagName.toLowerCase():''}})}",
 	"function onKey(e){if(e.key==='Escape'&&A){e.preventDefault();e.stopPropagation();off();send({source:'dsh-quick-pick',type:'cancel'})}}",
 	"function on(){if(A)return;A=true;if(!ST){ST=document.createElement('style');ST.id='__dqp_cur';ST.textContent='*,* *{cursor:crosshair !important;}';document.head&&document.head.appendChild(ST)}",
@@ -202,7 +202,7 @@ export function apply(ctx) {
 					'content-type': 'application/json; charset=utf-8',
 					'cache-control': 'no-store'
 				});
-				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.6' }));
+				res.end(JSON.stringify({ ok: true, plugin: 'dsh-quick-pick', version: '2.2.7' }));
 			}
 		}), 'dsh-quick-pick: ping');
 

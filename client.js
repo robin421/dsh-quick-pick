@@ -581,8 +581,10 @@
 		's.unshift(n+"["+i+"]");c=p;}return"/html/"+s.join("/");}' +
 		'function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;hov=el;var b=box(),r=el.getBoundingClientRect();' +
 		'b.style.display=(r.width||r.height)?"block":"none";b.style.left=r.left+"px";b.style.top=r.top+"px";b.style.width=r.width+"px";b.style.height=r.height+"px";}' +
-		'function onClick(e){if(!hov)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
-		'var x=xp(hov);try{window.parent.postMessage({source:"dsh-quick-pick",type:"picked",payload:{xpath:x}},"*");}catch(err){}off();}' +
+		'function onClick(e){var el=(e.target&&e.target.nodeType===1)?e.target:hov;if(!el)return;' +
+		'e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
+		'if(e.shiftKey&&el.parentElement&&el.parentElement!==document.documentElement)el=el.parentElement;' +
+		'var x=xp(el);try{window.parent.postMessage({source:"dsh-quick-pick",type:"picked",payload:{xpath:x,tag:el.tagName.toLowerCase()}},"*");}catch(err){}off();}' +
 		'function onKey(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();off();try{window.parent.postMessage({source:"dsh-quick-pick",type:"cancel"},"*");}catch(err){}}}' +
 		'function off(){on_=false;hov=null;document.removeEventListener("mouseover",onOver,true);document.removeEventListener("click",onClick,true);document.removeEventListener("keydown",onKey,true);' +
 		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();' +
@@ -591,7 +593,7 @@
 		'if(!s){s=document.createElement("style");s.id="__dqp_probe_cursor";s.textContent="*,* *{cursor:crosshair !important;}";(document.head||document.documentElement).appendChild(s);}' +
 		'var tip=document.getElementById("__dqp_probe_tip");if(!tip){tip=document.createElement("div");tip.id="__dqp_probe_tip";' +
 		'tip.style.cssText="position:fixed;right:12px;bottom:12px;z-index:2147483646;pointer-events:none;font:500 12px/1 -apple-system,system-ui,sans-serif;background:rgba(15,23,42,.82);color:#e2e8f0;padding:7px 11px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.22);";' +
-		'tip.textContent="选区副本 · 原页面未刷新 · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
+		'tip.textContent="选区模式 · Shift+点击选父级 · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
 		'document.addEventListener("mouseover",onOver,true);document.addEventListener("click",onClick,true);document.addEventListener("keydown",onKey,true);}' +
 		'window.addEventListener("message",function(ev){var d=ev.data;if(!d||d.source!=="dsh-quick-pick")return;' +
 		'if(d.type==="cancel"||d.type==="exit")off();else if(d.type==="activate")on();});' +
@@ -617,8 +619,10 @@
 		's.unshift(n+"["+i+"]");c=p;}return"/html/"+s.join("/");}' +
 		'function onOver(e){var el=e.target;if(!el||el.nodeType!==1)return;hov=el;var b=box(),r=el.getBoundingClientRect();' +
 		'b.style.display=(r.width||r.height)?"block":"none";b.style.left=r.left+"px";b.style.top=r.top+"px";b.style.width=r.width+"px";b.style.height=r.height+"px";}' +
-		'function onClick(e){if(!hov)return;e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
-		'var x=xp(hov);window.__dqpWvResult={xpath:x,tag:(hov&&hov.tagName?hov.tagName.toLowerCase():"")};off();}' +
+		'function onClick(e){var el=(e.target&&e.target.nodeType===1)?e.target:hov;if(!el)return;' +
+		'e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();' +
+		'if(e.shiftKey&&el.parentElement&&el.parentElement!==document.documentElement)el=el.parentElement;' +
+		'var x=xp(el);window.__dqpWvResult={xpath:x,tag:(el&&el.tagName?el.tagName.toLowerCase():"")};off();}' +
 		'function onKey(e){if(e.key==="Escape"){e.preventDefault();e.stopPropagation();window.__dqpWvResult={cancel:true};off();}}' +
 		'function off(){on_=false;hov=null;document.removeEventListener("mouseover",onOver,true);document.removeEventListener("click",onClick,true);document.removeEventListener("keydown",onKey,true);' +
 		'if(ov)ov.style.display="none";var s=document.getElementById("__dqp_probe_cursor");if(s)s.remove();' +
@@ -627,7 +631,7 @@
 		'if(!s){s=document.createElement("style");s.id="__dqp_probe_cursor";s.textContent="*,* *{cursor:crosshair !important;}";(document.head||document.documentElement).appendChild(s);}' +
 		'var tip=document.getElementById("__dqp_probe_tip");if(!tip){tip=document.createElement("div");tip.id="__dqp_probe_tip";' +
 		'tip.style.cssText="position:fixed;right:12px;bottom:12px;z-index:2147483646;pointer-events:none;font:500 12px/1 -apple-system,system-ui,sans-serif;background:rgba(15,23,42,.82);color:#e2e8f0;padding:7px 11px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.22);";' +
-		'tip.textContent="选区模式 · 点元素取 XPath · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
+		'tip.textContent="选区模式 · Shift+点击选父级 · Esc 退出";(document.body||document.documentElement).appendChild(tip);}' +
 		'document.addEventListener("mouseover",onOver,true);document.addEventListener("click",onClick,true);document.addEventListener("keydown",onKey,true);}' +
 		'window.__dqpWv={};window.__dqpWvOn=on;window.__dqpWvOff=off;on();return "on";' +
 		'})()';
