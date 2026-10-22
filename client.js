@@ -30,6 +30,11 @@
 (function () {
 	'use strict';
 
+	// 只初始化一次：前端在某些布局下会把插件 bundle 加载两遍，
+	// 两个实例各自持有一个按钮 → 互相 prune 对方的按钮 → 工具栏一闪一闪。
+	if (window.__dqpClientLoaded) return;
+	window.__dqpClientLoaded = true;
+
 	var SRC = 'dsh-quick-pick';
 	var CTX = null;
 	var LAST_ERR = '';
@@ -1390,6 +1395,12 @@
 
 	function createToolbarButton() {
 		if (TOOLBAR_BTN && TOOLBAR_BTN.isConnected) return TOOLBAR_BTN;
+		// 跨实例兜底：页面上已经有按钮就直接复用，绝不建第二个
+		var existing = document.getElementById('__dqp_tb');
+		if (existing) {
+			TOOLBAR_BTN = existing;
+			return existing;
+		}
 		var btn = document.createElement('button');
 		btn.className = BTN_CLASS;
 		btn.id = '__dqp_tb';
