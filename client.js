@@ -1291,7 +1291,7 @@
 			sessionStorage.setItem('dsh-quick-pick:announced', '1');
 		} catch (e) {}
 		setTimeout(function () {
-			showToast('XPath 选区已就绪：在「网页预览」工具栏上点「选区 (XPath)」，再点网页元素即可', false);
+			showToast('XPath 选区已就绪：点右上角 ✦（或 ⌘/Ctrl+Shift+E），再点网页元素即可', false);
 		}, 1800);
 	}
 
@@ -1433,13 +1433,62 @@
 		return btn;
 	}
 
+	// 会话页/开始页右上角的图标行（"视图选项"那一排）。
+	// 选区按钮优先挂在这里：位置固定、不会被预览工具栏重建带走。
+	function findTopbarRow() {
+		var all = document.querySelectorAll('button, [role="button"]');
+		for (var i = 0; i < all.length; i++) {
+			var b = all[i];
+			var l = (b.getAttribute('aria-label') || '') + ' ' + (b.title || '');
+			if (!/视图选项/.test(l)) continue;
+			var row = b.parentElement;
+			if (!row) continue;
+			if (!(row.offsetWidth || row.offsetHeight)) continue;
+			// 只认「视口右上角」那一行：侧边栏里的旧"视图选项"在左侧/中部，排除掉
+			var rect = row.getBoundingClientRect();
+			var vw = window.innerWidth || 1200;
+			if (rect.top > 180) continue;
+			if (rect.right < vw * 0.6) continue;
+			var visible = 0;
+			for (var k = 0; k < row.children.length; k++) {
+				var ch = row.children[k];
+				if (ch.offsetWidth || ch.offsetHeight) visible++;
+			}
+			if (visible >= 3) return row;
+		}
+		return null;
+	}
+
+	// 隐藏图标行里左起第二个图标（用户确认废弃的那个）。
+	// 只隐藏、不删代码；标签不认识时不动手，避免误伤别的功能。
+	function hideDeprecatedTopbarIcon(row) {
+		if (!row || row.__dqpPruned) return;
+		var icons = [];
+		for (var i = 0; i < row.children.length; i++) {
+			var ch = row.children[i];
+			if (ch === TOOLBAR_BTN) continue;
+			if (!(ch.offsetWidth || ch.offsetHeight)) continue;
+			icons.push(ch);
+		}
+		if (icons.length < 2) return;
+		var target = icons[1];
+		var label = (target.getAttribute('aria-label') || '') + ' ' + (target.title || '') + ' ' + (target.textContent || '');
+		report('topbar-icon2', { label: label.trim().slice(0, 60), cls: String(target.className || '').slice(0, 60) });
+		if (!/预览|preview|sandbox|沙箱|demo|网页/i.test(label)) return;
+		try { target.style.display = 'none'; } catch (e) {}
+		row.__dqpPruned = true;
+		report('topbar-icon2-hidden', { label: label.trim().slice(0, 60) });
+	}
+
 	function injectToolbarButtons() {
 		// 锚点优先级：网页预览工具栏（沙箱提示行）> 内置浏览器地址栏所在行。
 		// 全程只有一个按钮（单例），锚点变了就「移动」过去，不删不建：
 		// 这样无论 React 怎么重建工具栏，按钮要么在原位、要么被挪到新行，
 		// 不会出现反复注入 / 反复消失的闪烁。
 		// 锚点优先级：网页预览工具栏 > 内置浏览器工具栏整行 > 地址栏窄容器（最后兜底）
-		var anchor = findFilePreviewToolbar();
+		var topRow = findTopbarRow();
+		var anchor = topRow;
+		if (!anchor) anchor = findFilePreviewToolbar();
 		if (!anchor) anchor = findBrowserToolbar();
 		if (!anchor) {
 			var inputs = findAddressInputs();
@@ -1476,8 +1525,9 @@
 
 		if (btn.parentElement !== anchor) {
 			try { anchor.appendChild(btn); } catch (e) { return; }
-			reportInject(anchor === findFilePreviewToolbar() ? 1 : 2);
+			reportInject(topRow ? 3 : (anchor === findFilePreviewToolbar() ? 1 : 2));
 		}
+		if (topRow) hideDeprecatedTopbarIcon(topRow);
 		renderToolbarButtons();
 		pruneStrayButtons();
 
