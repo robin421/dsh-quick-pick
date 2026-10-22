@@ -1453,14 +1453,26 @@
 		}
 
 		if (!anchor) {
-			// 没有可挂载的视图：把按钮收起来（仍留在 DOM 里，等下次移动回去）
-			if (TOOLBAR_BTN && TOOLBAR_BTN.parentElement) {
-				try { TOOLBAR_BTN.remove(); } catch (e) {}
+			// 找不到任何工具栏（重启后视图还没渲染、或布局变了）：不再把按钮收起来，
+			// 改为固定在窗口右下角的悬浮入口 —— 这样「注入丢失」也永远有点击入口。
+			if (!hasPreviewView()) {
+				// 没有任何网页/预览视图（纯聊天界面）：不显示入口，保持界面干净
+				var b0 = TOOLBAR_BTN;
+				if (b0 && b0.parentElement) { try { b0.remove(); } catch (e) {} }
+				reportInject(0);
+				return;
 			}
-			reportInject(0);
+			var fbtn = createToolbarButton();
+			if (!fbtn.isConnected) {
+				try { document.body.appendChild(fbtn); } catch (e) {}
+			}
+			setFloating(fbtn, true);
+			renderToolbarButtons();
+			reportInject(-1);
 			return;
 		}
 		var btn = createToolbarButton();
+		setFloating(btn, false);
 
 		if (btn.parentElement !== anchor) {
 			try { anchor.appendChild(btn); } catch (e) { return; }
@@ -1482,6 +1494,55 @@
 				});
 			}
 			report('address-inputs', { count: inputs2.length, samples: samples });
+		}
+	}
+
+	// 页面上是否存在可见的网页/预览视图（iframe 或 Electron webview）
+	function hasPreviewView() {
+		try {
+			var nodes = document.querySelectorAll('iframe, webview');
+			for (var i = 0; i < nodes.length; i++) {
+				var n = nodes[i];
+				if (n.id === OVERLAY_FRAME_ID || n.id === PANEL_ID) continue;
+				if (n.offsetWidth >= 120 && n.offsetHeight >= 120) return true;
+			}
+		} catch (e) {}
+		return false;
+	}
+
+	// 悬浮模式：不参与任何布局，固定在窗口右下角（不挤工具栏、不影响网页界面）
+	function setFloating(btn, on) {
+		if (!btn) return;
+		if (btn.__dqpFloat === !!on) return;
+		btn.__dqpFloat = !!on;
+		if (on) {
+			btn.style.position = 'fixed';
+			btn.style.right = '18px';
+			btn.style.bottom = '18px';
+			btn.style.zIndex = '2147483000';
+			btn.style.height = '32px';
+			btn.style.minWidth = '32px';
+			btn.style.padding = '0 10px';
+			btn.style.borderRadius = '999px';
+			btn.style.background = 'rgba(59,130,246,0.92)';
+			btn.style.borderColor = 'rgba(255,255,255,0.35)';
+			btn.style.color = '#fff';
+			btn.style.boxShadow = '0 4px 14px rgba(0,0,0,0.22)';
+			btn.style.margin = '0';
+		} else {
+			btn.style.position = '';
+			btn.style.right = '';
+			btn.style.bottom = '';
+			btn.style.zIndex = '';
+			btn.style.height = '24px';
+			btn.style.minWidth = '24px';
+			btn.style.padding = '0 5px';
+			btn.style.borderRadius = '6px';
+			btn.style.background = 'rgba(59,130,246,0.12)';
+			btn.style.borderColor = 'rgba(59,130,246,0.55)';
+			btn.style.color = '#93c5fd';
+			btn.style.boxShadow = '';
+			btn.style.margin = '0 2px 0 4px';
 		}
 	}
 
@@ -1635,6 +1696,11 @@
 						try { injectToolbarButtons(); } catch (e) {}
 					}, 1500);
 					if (heal && heal.unref) heal.unref();
+					// 窗口在后台时定时器会被节流/暂停，回到前台立刻补一次，
+					// 避免"切回来发现按钮没了"
+					var wake = function () { try { injectToolbarButtons(); } catch (e) {} };
+					document.addEventListener('visibilitychange', wake);
+					window.addEventListener('focus', wake);
 					setTimeout(probeDom, 3000);
 					announceOnce();
 				};
